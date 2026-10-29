@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""omarchy-anime entry point. All code lives in ../lib/omarchy_anime (stdlib only)."""
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+if __name__ == "__main__":
+    # The bar runs `status` every ten seconds; it imports only what it reads, not the whole CLI.
+    from omarchy_anime import status  # noqa: E402
+    if status.lean_trace(sys.argv[1:]) is not None:
+        sys.exit(status.main(sys.argv[1:]))
+    from omarchy_anime.cli import main  # noqa: E402
+    sys.exit(main())

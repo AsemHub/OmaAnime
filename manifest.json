@@ -1,0 +1,430 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.asemhub.omaanime",
+  "name": "Anime",
+  "version": "1.0.0",
+  "author": "AsemHub",
+  "license": "MIT",
+  "description": "Watch your AniList anime through TorBox with preferred-language subtitles: one click to play, one click to hide, progress written back to AniList.",
+  "homepage": "https://github.com/AsemHub/OmaAnime",
+  "repository": "https://github.com/AsemHub/OmaAnime",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "overlay"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml",
+    "overlay": "Browse.qml"
+  },
+  "barWidget": {
+    "displayName": "Anime",
+    "description": "Continue watching from AniList, control the mpv player, hide and show it from the bar.",
+    "category": "Media",
+    "aliases": [
+      "anime",
+      "anilist",
+      "mpv"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "watchedThreshold": 85,
+      "autoNext": false,
+      "prefetchNext": true,
+      "showTitleInBar": false,
+      "maxTitleWidth": 180,
+      "pollIntervalSec": 5,
+      "showCompletedInTop": false,
+      "allowBatches": true,
+      "sideloadSubtitles": true,
+      "subtitleSyncMaxOffset": 60
+    },
+    "schema": [
+      {
+        "key": "subtitleLanguage",
+        "type": "string",
+        "label": "Subtitle language",
+        "options": [
+          "ara",
+          "baq",
+          "bos",
+          "cat",
+          "chi",
+          "zh-Hans",
+          "zh-Hant",
+          "hrv",
+          "cze",
+          "dan",
+          "dut",
+          "eng",
+          "fil",
+          "fin",
+          "fre",
+          "glg",
+          "ger",
+          "gre",
+          "heb",
+          "hin",
+          "hun",
+          "ind",
+          "ita",
+          "jpn",
+          "kor",
+          "may",
+          "nor",
+          "per",
+          "pol",
+          "por",
+          "pt-BR",
+          "pt-PT",
+          "rum",
+          "rus",
+          "sin",
+          "slo",
+          "spa",
+          "es-419",
+          "es-ES",
+          "swe",
+          "tha",
+          "tur",
+          "ukr",
+          "vie"
+        ],
+        "defaultValue": "eng",
+        "description": "The language you want subtitles in (ISO 639-2 code, or a region: pt-BR, es-419, zh-Hant). The release scorer prefers a release that embeds it, and the side-load borrows it when none does. A region picks its own track first in a file that has several. English by default."
+      },
+      {
+        "key": "subtitleFallbackLanguage",
+        "type": "string",
+        "label": "Second language",
+        "options": [
+          "off",
+          "ara",
+          "baq",
+          "bos",
+          "cat",
+          "chi",
+          "zh-Hans",
+          "zh-Hant",
+          "hrv",
+          "cze",
+          "dan",
+          "dut",
+          "eng",
+          "fil",
+          "fin",
+          "fre",
+          "glg",
+          "ger",
+          "gre",
+          "heb",
+          "hin",
+          "hun",
+          "ind",
+          "ita",
+          "jpn",
+          "kor",
+          "may",
+          "nor",
+          "per",
+          "pol",
+          "por",
+          "pt-BR",
+          "pt-PT",
+          "rum",
+          "rus",
+          "sin",
+          "slo",
+          "spa",
+          "es-419",
+          "es-ES",
+          "swe",
+          "tha",
+          "tur",
+          "ukr",
+          "vie"
+        ],
+        "defaultValue": "eng",
+        "description": "Used only when no release has your language: a release whose subtitles include this one ranks higher. off scores every release by its name alone."
+      },
+      {
+        "key": "subtitlePolicy",
+        "type": "string",
+        "label": "When that language is missing",
+        "options": [
+          "prefer",
+          "require"
+        ],
+        "defaultValue": "prefer",
+        "description": "prefer plays the best release anyway and says so; require refuses to play rather than show the wrong language."
+      },
+      {
+        "key": "dubs",
+        "type": "string",
+        "label": "Dubbed versions",
+        "options": [
+          "avoid",
+          "allow"
+        ],
+        "defaultValue": "avoid",
+        "description": "avoid never plays a dubbed version while one in the show's original language exists, and waits for TorBox to download that one; allow plays a dubbed version TorBox already has."
+      },
+      {
+        "key": "preferredResolution",
+        "type": "integer",
+        "label": "Preferred resolution",
+        "min": 480,
+        "max": 2160,
+        "defaultValue": 1080,
+        "description": "Releases at this height score highest; others are still playable.",
+        "options": [
+          720,
+          1080,
+          2160
+        ]
+      },
+      {
+        "key": "subtitleFont",
+        "type": "string",
+        "label": "Subtitle font",
+        "defaultValue": "",
+        "description": "Empty follows the subtitle language (Noto Naskh Arabic UI for Arabic and Persian, Noto Sans Devanagari UI for Hindi, Noto Sans CJK SC or JP for Chinese or Japanese, mpv's default otherwise). A family typed here is used when fc-match confirms it is installed; it applies from the next episode."
+      },
+      {
+        "key": "watchedThreshold",
+        "type": "integer",
+        "label": "Mark watched at (percent)",
+        "min": 50,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 85,
+        "description": "The episode is written to AniList once playback passes this point, or at the end of the file (not when a stream stops early)."
+      },
+      {
+        "key": "autoNext",
+        "type": "boolean",
+        "label": "Autoplay the next episode",
+        "defaultValue": false,
+        "description": "When an episode ends, start the next aired one."
+      },
+      {
+        "key": "prefetchNext",
+        "type": "boolean",
+        "label": "Get the next episode ready",
+        "defaultValue": true,
+        "description": "Once you have watched two minutes of an episode, ask TorBox to download the next one if it doesn't have it yet, so it starts at once when you get to it. Only for an episode that has aired, and only when TorBox comes first in your providers."
+      },
+      {
+        "key": "showTitleInBar",
+        "type": "boolean",
+        "label": "Show the title on the bar",
+        "defaultValue": false,
+        "description": "Off leaves just the icon."
+      },
+      {
+        "key": "maxTitleWidth",
+        "type": "integer",
+        "label": "Maximum title width",
+        "min": 0,
+        "max": 560,
+        "step": 20,
+        "defaultValue": 180,
+        "description": "Width in pixels before the bar title is cut with an ellipsis. 0 is unlimited."
+      },
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Position poll (seconds)",
+        "min": 2,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "How often the bar asks mpv for the playback position."
+      },
+      {
+        "key": "showCompletedInTop",
+        "type": "boolean",
+        "label": "Show completed entries in Top 100",
+        "defaultValue": false,
+        "description": "Used by the Browse view."
+      },
+      {
+        "key": "allowBatches",
+        "type": "boolean",
+        "label": "Use season packs",
+        "defaultValue": true,
+        "description": "When single-episode releases are dead, stream the episode's file out of a batch torrent."
+      },
+      {
+        "key": "sideloadSubtitles",
+        "type": "boolean",
+        "label": "Borrow subtitles from another release",
+        "defaultValue": true,
+        "description": "When the release being played has no track in your preferred language, download that language's subtitle file from another release of the same episode and load it."
+      },
+      {
+        "key": "subtitleSyncMaxOffset",
+        "type": "integer",
+        "label": "Subtitle sync window (seconds)",
+        "min": 0,
+        "max": 120,
+        "step": 10,
+        "defaultValue": 60,
+        "description": "How far a borrowed subtitle file may be shifted to match this release. 0 loads it unshifted."
+      },
+      {
+        "key": "providers",
+        "type": "list",
+        "itemType": "string",
+        "label": "Stream providers, in order",
+        "options": [
+          "torbox",
+          "realdebrid"
+        ],
+        "advanced": true,
+        "defaultValue": "torbox,realdebrid",
+        "description": "Tried top to bottom; a provider with no token is skipped. TorBox leads because Real-Debrid's keyword filter rejects anime WEB releases. The plugin never streams a torrent itself."
+      },
+      {
+        "key": "indexers",
+        "type": "list",
+        "itemType": "string",
+        "label": "Indexer add-ons, in order",
+        "advanced": true,
+        "defaultValue": "",
+        "description": "File names (without .py) of the add-ons in the indexers folder of the plugin's config directory, asked in this order. Add-ons not listed are asked after these, by name. The plugin ships no indexer."
+      },
+      {
+        "key": "indexerTimeoutSeconds",
+        "type": "integer",
+        "label": "Indexer time limit (seconds)",
+        "min": 5,
+        "max": 300,
+        "advanced": true,
+        "defaultValue": 60,
+        "description": "How long one indexer add-on may take to answer an episode search. One that takes longer is skipped for that play and the others are used."
+      },
+      {
+        "key": "preferredGroups",
+        "type": "list",
+        "itemType": "string",
+        "label": "Preferred fansub groups",
+        "advanced": true,
+        "defaultValue": "",
+        "description": "Fansub groups to rank up, as a name (worth 8 points) or name=points (-20 to 20). This only counts for a group the plugin has not yet learned about: once it has seen which subtitles a group ships, what it learned decides. Empty by default; the plugin favours no group."
+      },
+      {
+        "key": "englishOnlyGroups",
+        "type": "list",
+        "itemType": "string",
+        "label": "English-only fansub groups",
+        "advanced": true,
+        "defaultValue": "",
+        "description": "Fansub groups known to ship English subtitles only. When your subtitle language is not English, a release from one of them is placed after any other release with the same score and seeders; it gains or loses no points. A group also in the preferred list is not treated as English-only. Empty by default."
+      },
+      {
+        "key": "subtitleCheckCount",
+        "type": "integer",
+        "label": "Releases checked for subtitles per play",
+        "min": 1,
+        "max": 40,
+        "advanced": true,
+        "defaultValue": 16,
+        "description": "How many of the best-ranked releases have their subtitle tracks read from their indexer add-on, when it offers them. More means a better chance of your language and a slower search."
+      },
+      {
+        "key": "subtitleCheckSeconds",
+        "type": "integer",
+        "label": "Time for subtitle checks per play (seconds)",
+        "min": 1,
+        "max": 120,
+        "advanced": true,
+        "defaultValue": 15,
+        "description": "How long reading those subtitle tracks may take per play. No read starts after it, and a slow or unreachable site is given up on at about this time. Two failed reads in a row also stop the reading. More means a better chance of your language on a slow site and a slower start."
+      },
+      {
+        "key": "probeCount",
+        "type": "integer",
+        "label": "Releases probed per provider",
+        "min": 1,
+        "max": 10,
+        "advanced": true,
+        "defaultValue": 3,
+        "description": "How many candidates are resolved and ffprobed before the best fallback is accepted."
+      },
+      {
+        "key": "providerBlockMinutes",
+        "type": "integer",
+        "label": "Remember a refusal for (minutes)",
+        "min": 1,
+        "max": 120,
+        "step": 5,
+        "advanced": true,
+        "defaultValue": 15,
+        "description": "A provider that refuses three releases in a row is skipped for the rest of the play and for this long afterwards, then probed once more. It can never be disabled permanently by this."
+      },
+      {
+        "key": "rdPollSeconds",
+        "type": "integer",
+        "label": "Debrid wait (seconds)",
+        "min": 5,
+        "max": 120,
+        "advanced": true,
+        "defaultValue": 30,
+        "description": "How long to wait for a magnet that is not cached yet before giving up on it."
+      },
+      {
+        "key": "torboxWaitSeconds",
+        "type": "integer",
+        "label": "Ready episode starts by itself after a wait of up to (seconds)",
+        "min": 0,
+        "max": 600,
+        "advanced": true,
+        "defaultValue": 60,
+        "description": "When a play waited for the one download it starts at TorBox: if TorBox had the episode within this many seconds of starting the play, it starts playing by itself. After a longer wait it loads paused and you get a notification with a sound, since you will have looked away; nothing plays while you are away. Hiding or showing the player makes no difference. 0 always loads it paused. It does not end the wait: the play waits until TorBox is done, you choose, or three hours."
+      },
+      {
+        "key": "torrentInfoSeconds",
+        "type": "integer",
+        "label": "Pack file list lookup (seconds)",
+        "min": 0,
+        "max": 30,
+        "advanced": true,
+        "defaultValue": 5,
+        "description": "When no indexer add-on lists a pack's files, TorBox can read them from the BitTorrent network without adding the pack, so the right episode file is chosen and packs are compared by episode size. How long it may search; 0 turns it off. Asked only when TorBox is one of your providers with a token."
+      },
+      {
+        "key": "httpTimeout",
+        "type": "integer",
+        "label": "HTTP timeout (seconds)",
+        "min": 5,
+        "max": 60,
+        "advanced": true,
+        "defaultValue": 15,
+        "description": "Per request, to AniList, ani.zip, the indexer add-ons and the providers. Retries are on top of this."
+      },
+      {
+        "key": "subsCacheMaxBytes",
+        "type": "integer",
+        "label": "Subtitle cache limit",
+        "min": 1048576,
+        "max": 536870912,
+        "advanced": true,
+        "defaultValue": 16777216,
+        "description": "The sheet shows this in MiB. Borrowed subtitle files are 20-30 KB each; `subs prune` and the daily prune after a play enforce it."
+      },
+      {
+        "key": "anilistClientId",
+        "type": "integer",
+        "label": "AniList API client id",
+        "min": 1,
+        "max": 1000000000,
+        "advanced": true,
+        "defaultValue": 51175,
+        "description": "Only if you use your own AniList app. Implicit-grant client ids are public; the token they produce is not, and never leaves ~/.config/omaanime."
+      }
+    ]
+  }
+}

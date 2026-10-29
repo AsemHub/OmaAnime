@@ -1,0 +1,132 @@
+#!/bin/bash
+# omarchy-anime-player — start the plugin's mpv instance once per session.
+#
+# Every flag verified on mpv 0.41 (2026-09).
+# Idempotent: exits 0 immediately when the socket already answers.
+
+set -euo pipefail
+
+SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omaanime-mpv.sock"
+# A hand launch's languages. mpv.py always passes the settings; these two defaults are copies of
+# `core.DEFAULT_SETTINGS` (`subtitleLanguage`, `subtitleFallbackLanguage`): keep them equal; a test checks.
+SUB_LANG="${OMARCHY_ANIME_SUB_LANG:-eng}"
+SUB_SECOND="${OMARCHY_ANIME_SUB_SECOND-eng}"   # the second language; empty for `off`
+SUB_FONT="${OMARCHY_ANIME_SUB_FONT:-}"
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+EPISODES_LUA="$HERE/../mpv/omarchy-anime-episodes.lua"
+# The message carries a typed font name, so `\` and `"` are escaped to keep the line valid JSON.
+log() {
+  local msg="${2//\\/\\\\}"
+  msg="${msg//\"/\\\"}"
+  printf '{"ts":"%s","level":"%s","component":"player.launch","msg":"%s"}\n' "$(date -u +%FT%T.%3NZ)" "$1" "$msg" >&2
+}
+
+# --sub-font sets libass's DEFAULT family, which is what an ASS style falls back to when the font it
+# names is missing — and anime ASS files routinely name one that is (the Kumo-raws Arabic track asks
+# for "adobe arabic", which resolves to LiberationSans here). Guarded, so a machine without the font
+# keeps today's behaviour and the launcher never fails.
+#
+# The guard compares the family fontconfig RETURNS with the one we asked for. Measured 2026-09-16:
+#   fc-match -f '%{family}' "Noto Naskh Arabic"        -> Noto Naskh Arabic      (installed)
+#   fc-match -f '%{family}' "DefinitelyNotInstalled"   -> Liberation Sans        (substituted)
+# Note that the `:lang=ar` form is NOT a guard: fontconfig substitutes an Arabic
+# face for anything, so `fc-match "DefinitelyNotInstalled:lang=ar"` also answers Noto Naskh Arabic.
+# A generic family is resolved, never echoed: `fc-match sans-serif` -> Liberation Sans, the
+# same as for a missing name, and `fc-list` lists neither (fontconfig 2.18.3). So those are named here,
+# as a copy of player.GENERIC_FAMILIES (plugin/lib/omarchy_anime/player.py), the rule's one home.
+FONT_ARGS=()
+if [[ -n $SUB_FONT ]] && command -v fc-match >/dev/null 2>&1; then
+  matched="$(fc-match -f '%{family}' "$SUB_FONT" 2>/dev/null || true)"
+  if [[ ${SUB_FONT,,} == @(sans-serif|serif|monospace) ]]; then
+    FONT_ARGS+=(--sub-font="$SUB_FONT")
+    log info "subtitle font $SUB_FONT is a fontconfig generic family (resolves to '$matched'); passing --sub-font"
+  elif [[ -n $matched && ${matched,,} == *"${SUB_FONT,,}"* ]]; then
+    FONT_ARGS+=(--sub-font="$SUB_FONT")
+    log info "subtitle font $SUB_FONT is installed; passing --sub-font"
+  else
+    log info "subtitle font $SUB_FONT is not installed (fc-match gave '$matched'); libass falls back"
+  fi
+fi
+# One of three copies of this installed-font rule: player.font_installed (per play) and the panel's
+# detect_arabic_font (mpv/omarchy-anime-episodes.lua) hold the other two.
+
+# The in-player episode list. `--script-opt` is SINGULAR and appends; the plural
+# `--script-opts` "overwrites the internal list" (man mpv) and would silently drop any script-opts
+# the user set in their own ~/.config/mpv/mpv.conf — this launcher does not pass --no-config.
+# The option name is <script name>-<key> with the script name underscored, exactly as the manual's
+# own --script-opts=ytdl_hook-exclude= example.
+SCRIPT_ARGS=()
+# The window is shown at claim time now, so mpv's own idle screen — the logo and
+# "Drop files or URLs to play here." — is what the user sees for the moment before the loading art
+# goes up, and for the whole wait on a cold show whose art missed its budget. A blank window is the
+# honest degradation there; an invitation to drag files in is not. `idlescreen` is an OSC option
+# (man mpv, "OSC ... idlescreen / Default: yes / Show the mpv logo and message when idle"), so it is
+# set the same singular way as the panel's own options above. Unconditional: it has nothing to do
+# with whether the episode panel is installed.
+SCRIPT_ARGS+=(--script-opt=osc-idlescreen=no)
+if [[ -r $EPISODES_LUA ]]; then
+  SCRIPT_ARGS+=(--script="$EPISODES_LUA")
+  SCRIPT_ARGS+=(--script-opt=omarchy_anime_episodes-bin="$HERE/omarchy-anime")
+  # No `-font` here: the panel is interface text and draws in `osd-font`; the
+  # per-language subtitle font must not reach it.
+  log info "episode panel: $EPISODES_LUA (Tab in the player)"
+else
+  log info "episode panel not installed at $EPISODES_LUA; the player runs without it"
+fi
+
+if [[ -S $SOCK ]] && echo '{"command":["get_property","idle-active"]}' | socat -t 1 - "$SOCK" 2>/dev/null | grep -q '"success"'; then
+  log info "mpv already running on $SOCK"
+  echo "running"
+  exit 0
+fi
+
+rm -f "$SOCK"
+# The four `--save-position-on-quit=no` … `--log-file=` lines: the stream URL a TorBox play loads carries the
+# account key (`?token=`), and a user's own mpv.conf may turn on watch-later (with the file name written in), the
+# watch history or a log file, each of which would write it to disk. Given here they win over mpv.conf (checked on
+# mpv 0.41: a config with all three wrote the key to three files; with these four, none). Not `--no-config`: it
+# also drops /etc/mpv/scripts (mpv-mpris, the media keys) and every tweak the user made. The plugin's own resume
+# point (`resume.json`) is not mpv's watch-later and is unaffected.
+# `--tls-verify=yes`: for the same key. mpv's default is no, so https stopped only a listener: anyone in the middle of
+# the network could present any certificate and be sent `GET …?token=` (measured on mpv 0.41 with a self-signed
+# local server: with the flag, the server received nothing). Arch's ffmpeg (built with GnuTLS) checks against the
+# system's trust store. The cost: a server whose certificate does not check out does not play; the play says so
+# (`say.certificate_refused`).
+# setsid -f: detach from the calling terminal/process so a CLI exit never kills the player.
+setsid -f mpv \
+  --no-terminal \
+  --idle=yes \
+  --keep-open=yes \
+  --force-window=immediate \
+  --input-ipc-server="$SOCK" \
+  --wayland-app-id=omaanime-player \
+  --title='Anime — ${media-title}' \
+  --wayland-content-type=video \
+  --slang="$SUB_LANG${SUB_SECOND:+,$SUB_SECOND}" \
+  ${FONT_ARGS[@]+"${FONT_ARGS[@]}"} \
+  ${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"} \
+  --alang=jpn,ja \
+  --subs-fallback=default \
+  --ytdl=no \
+  --cache=yes \
+  --demuxer-max-bytes=256MiB \
+  --stop-screensaver=yes \
+  --user-agent="omaanime/0.1" \
+  --osc=yes \
+  --save-position-on-quit=no \
+  --write-filename-in-watch-later-config=no \
+  --save-watch-history=no \
+  --log-file= \
+  --tls-verify=yes \
+  </dev/null >/dev/null 2>&1
+
+for _ in $(seq 1 50); do
+  if [[ -S $SOCK ]] && echo '{"command":["get_property","idle-active"]}' | socat -t 1 - "$SOCK" 2>/dev/null | grep -q '"success"'; then
+    log info "mpv started, socket $SOCK"
+    echo "started"
+    exit 0
+  fi
+  sleep 0.1
+done
+log error "mpv socket did not appear within 5s at $SOCK"
+exit 1
