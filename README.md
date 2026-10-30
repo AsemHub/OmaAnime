@@ -54,6 +54,17 @@ mkdir -p ~/.local/bin && ln -sf ~/.config/omarchy/plugins/io.github.asemhub.omaa
 Then click the Anime icon in the bar, open **Settings**, and connect **AniList**, **TorBox** and your **Prowlarr or
 Jackett** under Accounts. That's it: pick a show and press play.
 
+## Remove
+
+Quit the player first (`q` in its window), then:
+
+```sh
+omarchy plugin disable io.github.asemhub.omaanime
+omarchy plugin remove io.github.asemhub.omaanime
+rm -f ~/.local/bin/omarchy-anime
+rm -rf ~/.config/omaanime ~/.cache/omaanime   # optional: sign-ins, settings, your add-ons, caches, logs
+```
+
 ## Using it
 
 | | |
