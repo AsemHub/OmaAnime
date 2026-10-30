@@ -392,8 +392,8 @@ Item {
           return
         }
         if (a && typeof a === "object") root.accounts = a
-        // An open of the sheet asked for it, and the Torznab list is empty: look for a local server.
-        if (findWanted && a && typeof a === "object" && Logic.torznabListEmpty(a.torznab)) root.findLocalTorznab()
+        // An open of the sheet asked for it, and servers can be added to the Torznab list: look for a local one.
+        if (findWanted && a && typeof a === "object" && Logic.torznabListUsable(a.torznab)) root.findLocalTorznab()
       }
     }
     onExited: function (code) {
@@ -483,6 +483,10 @@ Item {
   // arrive in no guaranteed order, so a run is over only when both have been seen, and output that
   // arrives while `deviceExpectedStop` is set belongs to the run being stopped, not to the sheet.
   property bool deviceExpectedStop: false
+  // The code is put on the clipboard the moment it shows (`Logic.deviceCopyWanted`), so the viewer pastes it
+  // at TorBox. "copied" or "failed" is what the sheet says under the code; "" before the copy has answered.
+  property string torboxCodeClip: ""
+  property string deviceCopiedTrace: ""
   property bool deviceQueued: false
   property bool deviceExited: true
   property bool deviceStreamDone: true
@@ -516,6 +520,7 @@ Item {
     deviceExited = false
     deviceStreamDone = false
     torboxDevice = { state: "starting" }
+    torboxCodeClip = ""
     deviceProc.trace = trace
     deviceProc.command = [bin, "--trace", trace, "auth", "torbox", "--device"]
     deviceProc.running = true
@@ -546,12 +551,51 @@ Item {
   function setTorBoxDevice(next) {
     var was = torboxDevice.state
     torboxDevice = next
+    if (Logic.deviceCopyWanted(next, deviceProc.trace, deviceCopiedTrace)) copyDeviceCode(next.code)
     if (next.state === was) return
     // The state only: never the code, the URL's query, or a line of the CLI's output.
     logEvent(deviceProc.trace || newTrace("auth"), "ui.accounts.device", { provider: "torbox", state: String(next.state) })
     if (next.state === "saved") {
       accountsError = ""
       loadAccounts(true)          // the read-back is what the row draws
+    }
+  }
+
+  // **The code goes over stdin, never argv** (the token's idiom, `signIn`): `wl-copy` with no text argument copies
+  // what it reads until EOF, exactly, so no newline is written. `wl-copy`, not `Quickshell.clipboardText`: that one is
+  // documented to work on Wayland only while a Quickshell window is focused, and the viewer is often in the browser by
+  // the time TorBox answers. The log says that it was copied, never the code.
+  function copyDeviceCode(code) {
+    deviceCopiedTrace = deviceProc.trace
+    torboxCodeClip = ""
+    if (deviceCopyProc.running) deviceCopyProc.running = false
+    deviceCopyProc.secret = String(code)
+    deviceCopyProc.trace = deviceProc.trace
+    deviceCopyProc.running = true
+  }
+
+  // `wl-copy`'s exit: what the row says (`Logic.deviceClipResult`), and one line that says it, never the code.
+  function deviceCopyEnded(code) {
+    torboxCodeClip = Logic.deviceClipResult(code)
+    logEvent(deviceCopyProc.trace || newTrace("auth"), "ui.accounts.device",
+             { provider: "torbox", clipboard: torboxCodeClip, exit: code })
+  }
+
+  Process {
+    id: deviceCopyProc
+    property string secret: ""
+    property string trace: ""
+    command: ["wl-copy"]
+    stdinEnabled: true
+    onStarted: {
+      write(secret)
+      secret = ""                 // gone from this object the moment it is handed over
+      stdinEnabled = false        // wl-copy's EOF
+    }
+    onExited: function (code) {
+      deviceCopyProc.secret = ""
+      stdinEnabled = true
+      root.deviceCopyEnded(code)
     }
   }
 
@@ -678,9 +722,10 @@ Item {
     return true
   }
 
-  // A Prowlarr or Jackett running on this computer, offered while the list is empty. `torznab find-local` asks
-  // loopback only, with no key, in its own Process (about 1 s); it saves nothing. Asked once per open of the sheet
-  // (`wantLocalTorznab`, then the next `accounts` answer decides), never after an add, check or remove's read-back.
+  // A Prowlarr or Jackett running on this computer, offered until it is listed (Browse filters the answer against the
+  // list, BrowseModel.js `torznabOffers`). `torznab find-local` asks loopback only, with no key, in its own Process
+  // (about 1 s); it saves nothing. Asked once per open of the sheet (`wantLocalTorznab`, then the next `accounts`
+  // answer decides), never after an add, check or remove's read-back: the answer of the open stands until the next.
   property bool torznabFindWanted: false
   property var torznabLocal: null        // the last `find-local` answer: {found:[...], asked:[...]}
 
@@ -750,9 +795,8 @@ Item {
         // The add's check shows under the server's row too (it is there once the file is read back).
         if (r && r.check && r.words)
           root.noteTorznabCheck(String(r.check.row || ""), { ok: r.check.ok, transient: r.check.transient, words: r.words })
-        // A saved server has used the offer; its answer never comes back in this open (a server can
-        // stop meanwhile), even when the list is emptied again.
-        if (r && r.saved === true) root.torznabLocal = null
+        // A saved server keeps the open's answer: the read-back lists it, so Browse stops offering it, and
+        // another server found beside it is still offered.
         root.torznabBusy = ""
         root.loadAccounts(false)    // the rows are the file read back, not this answer
       }
@@ -2016,7 +2060,7 @@ Item {
         return "usage: browse [" + allowed.join("|") + "]"
       if (!root.shell || typeof root.shell.summon !== "function") return "no shell api"
       root.logEvent(root.newTrace("browse-ipc"), "browse.ipc", { view: name })
-      var payload = name === "" ? "{}" : JSON.stringify({ view: name })
+      var payload = name === "" ? "{}" : JSON.stringify({ view: name, from: "ipc" })
       return root.shell.summon(root.pluginId, payload) === false ? "could not open the overlay" : "ok"
     }
     // `omarchy-shell omaanime picker <mediaId> <episode>` opens the overlay on the release

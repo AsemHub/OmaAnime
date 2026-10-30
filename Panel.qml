@@ -778,7 +778,7 @@ Panel {
           onClicked: {
             root.close()
             if (root.bar && root.bar.shell)
-              root.bar.shell.summon(root.moduleName, JSON.stringify({ view: "settings" }))
+              root.bar.shell.summon(root.moduleName, JSON.stringify({ view: "settings", from: "popout" }))
           }
         }
       }

@@ -131,12 +131,19 @@ Item {
   property int cellIndex: 0
   property bool settingWatching: false
 
-  // ---------------------------------------------------------------- settings sheet
-  // A sheet, not a fifth tab: settings are not a browsing view. It opens on `,` from anywhere in
-  // the overlay, from the popout's Settings button, and from the payload {"view":"settings"} —
-  // which reaches open() because this plugin declares `overlay`, so shell.qml's
-  // isBarWidgetPanelPlugin is false for it and the payload is not dropped (shell.qml:1178).
+  // ---------------------------------------------------------------- settings window
+  // Not a fifth tab: settings are not a browsing view. Its own window (`settingsWindow`), opened on `,` from
+  // anywhere in the overlay, from the popout's Settings button, and from the payload {"view":"settings"} — which
+  // reaches open() because this plugin declares `overlay`, so shell.qml's isBarWidgetPanelPlugin is false for it and
+  // the payload is not dropped (shell.qml:1178). Only `openSettings` and `closeSettings` change `settingsOpen`.
   property bool settingsOpen: false
+  // Opened with no overlay behind it (the popout, `omarchy-shell omaanime browse settings`): closing it closes this
+  // plugin's surface, instead of bringing the overlay back.
+  property bool settingsAlone: false
+  // Where it was opened from, for the open and close lines: "browse" (`,`, the ⚙ button), "popout", "ipc", "payload".
+  property string settingsFrom: ""
+  readonly property bool settingsShown: root.opened && root.settingsOpen
+  onSettingsShownChanged: root.showSettingsWindow(root.settingsShown)
   // The release picker sheet. Opened by a refusal (Service.pickerWanted) or by `p`, for one
   // episode; its rows come from `releases` through Service.pickerData.
   property bool pickerOpen: false
@@ -316,11 +323,28 @@ Item {
   // "up to N s", from the CLI's own check budget (`checkBudget` in the `torznab` block).
   readonly property string torznabWait: Model.torznabBudgetText(root.service && root.service.accounts
                                                                 ? root.service.accounts.torznab : null)
-  // A Prowlarr or Jackett found on this computer, offered while the list is empty; its button opens the add row
-  // with the address filled in and the key field focused. Nothing is saved until Add and check.
-  readonly property var torznabOffers: Model.torznabOffers(
-      root.logic.torznabListEmpty(root.service && root.service.accounts ? root.service.accounts.torznab : null),
+  // A Prowlarr or Jackett found on this computer, offered until the list holds its address (right after a save
+  // too, so adding Prowlarr leaves Jackett offered); its button opens the add row with the address filled in and the
+  // key field focused. Nothing is saved until Add and check.
+  readonly property var torznabOfferState: Model.torznabOfferDecision(
+      root.logic.torznabListUsable(root.service && root.service.accounts ? root.service.accounts.torznab : null),
+      root.service && root.service.accounts ? root.service.accounts.torznab : null,
       root.service ? root.service.torznabLocal : null)
+  readonly property var torznabOffers: root.torznabOfferState.offers
+  // The decision, once per open and per change: what was found, which of it is already listed, what is offered
+  // (products only, never an address). Nothing until `find-local` has answered.
+  property string torznabOfferLogged: ""
+  onTorznabOfferStateChanged: root.noteTorznabOffers()
+  function noteTorznabOffers() {
+    if (!root.settingsOpen || !root.service || !root.service.torznabLocal) return
+    var st = root.torznabOfferState
+    var data = { action: "offer", found: st.found, listed: st.listed,
+                 offered: st.offers.map(function (o) { return o.product }) }
+    var key = JSON.stringify(data)
+    if (key === root.torznabOfferLogged) return
+    root.torznabOfferLogged = key
+    root.svc.logEvent(root.svc.newTrace("torznab"), "ui.accounts.torznab", data)
+  }
   property bool torznabAdding: false       // the add row is open
   property string torznabConfirm: ""       // the server whose "Really remove?" is showing
 
@@ -362,7 +386,10 @@ Item {
 
   function openPicker(mediaId, episode, refresh) {
     if (!root.service || !(Number(mediaId) > 0) || !(Number(episode) > 0)) return
-    root.settingsOpen = false
+    if (root.settingsOpen) {
+      root.settingsAlone = false        // the picker is on the overlay, so the overlay stays
+      root.closeSettings("picker")
+    }
     root.pickerMediaId = Number(mediaId)
     root.pickerEpisode = Number(episode)
     root.pickerIndex = 0
@@ -407,23 +434,56 @@ Item {
                                               release: item.hash, rejected: item.dim, index: root.pickerIndex })
   }
 
-  function openSettings() {
-    if (root.settingsOpen) return
+  // `from` says where (`settingsFrom`). Asked again while it is open, the window is shown again rather than reset,
+  // so a paste field or a sign-in in progress keeps its state.
+  function openSettings(from) {
+    var where = String(from || "browse")
+    if (root.settingsOpen) {
+      if (root.service) root.svc.logEvent(root.svc.newTrace("settings"), "ui.settings.open",
+                                          { from: where, again: true, alone: root.settingsAlone })
+      root.raiseSettings()
+      return
+    }
     root.settingsOpen = true
+    root.settingsFrom = where
+    root.torznabOfferLogged = ""
     if (!root.service) return
-    root.svc.logEvent(root.svc.newTrace("settings"), "ui.settings.open", {})
+    root.svc.logEvent(root.svc.newTrace("settings"), "ui.settings.open", { from: where, alone: root.settingsAlone })
     // The providers come from the ten-minute cache; the indexer add-ons are read fresh,
     // so a file dropped in or fixed shows the next time the sheet opens. The accounts first, the extra after;
     // the find is decided when this read answers, a later turn.
     root.svc.loadAccounts(false)
-    root.svc.wantLocalTorznab()     // with no Torznab server, look for one on this computer
+    root.svc.wantLocalTorznab()     // look for a Prowlarr or Jackett on this computer
   }
 
-  function closeSettings() {
+  // `how`: "escape", "button" (✕), "window" (the compositor closed it), "picker", "summon" (Browse asked for), "host".
+  // Alone, the plugin's surface goes with it; else the overlay comes back with the keyboard.
+  function closeSettings(how) {
     if (!root.settingsOpen) return
+    var alone = root.settingsAlone
     root.settingsOpen = false
-    if (root.service) root.svc.logEvent(root.svc.newTrace("settings"), "ui.settings.close", {})
+    root.settingsAlone = false
+    if (root.service)
+      root.svc.logEvent(root.svc.newTrace("settings"), "ui.settings.close",
+                        { how: String(how || ""), from: root.settingsFrom, then: alone ? "closed" : "browse" })
+    if (alone) {
+      root.dismiss()
+      return
+    }
     Qt.callLater(function () { if (root.opened) keyCatcher.forceActiveFocus() })
+  }
+
+  function showSettingsWindow(shown) {
+    settingsWindow.visible = shown
+    if (shown) Qt.callLater(function () { if (root.settingsShown) settingsKeys.forceActiveFocus() })
+  }
+
+  // Shown again, so a window left on another workspace or behind the browser comes to where the viewer is: a new
+  // surface, mapped where a new window goes (the items, and every field's text, are kept).
+  function raiseSettings() {
+    if (!root.settingsShown) return
+    settingsWindow.visible = false
+    Qt.callLater(function () { root.showSettingsWindow(root.settingsShown) })
   }
 
   // Search runs one live AniList call per query. `searchSerial` rises with every request the
@@ -475,15 +535,20 @@ Item {
     // `{"view":"advanced"}` is `settings` with the disclosure already open — a direct route to the
     // ten keys behind it, the same way `settings` is a direct route to the sheet.
     var wanted = String(payload.view || "")
-    root.settingsOpen = wanted === "settings" || wanted === "advanced" || wanted === "accounts"
-    if (wanted === "advanced") root.advancedOpen = true
-    root.signingIn = ""
-    root.confirmingOut = ""
-    // The sheet opens at the top, which is where Accounts is, so `accounts` needs no scrolling —
-    // only the state: the providers from a 10-minute cache, the indexer add-ons read fresh.
-    if (root.settingsOpen && root.service) {
-      root.svc.loadAccounts(false)
-      root.svc.wantLocalTorznab()   // after the accounts
+    var wantsSettings = wanted === "settings" || wanted === "advanced" || wanted === "accounts"
+    if (wantsSettings) {
+      // With no overlay up, Settings comes alone; over an open overlay it closes back to it.
+      if (!root.settingsOpen) root.settingsAlone = !root.opened
+      if (wanted === "advanced") root.advancedOpen = true
+    } else if (root.settingsOpen) {
+      // Browse asked for while Settings is up: the overlay would cover the window, so the window closes and the
+      // overlay shows (a TorBox sign-in keeps waiting in the Service; reopening Settings shows it again).
+      root.settingsAlone = false
+      root.closeSettings("summon")
+    }
+    if (!root.settingsOpen) {
+      root.signingIn = ""
+      root.confirmingOut = ""
     }
     if (payload.view && root.viewIds.indexOf(String(payload.view)) !== -1) root.view = String(payload.view)
     root.playPending = false
@@ -494,6 +559,9 @@ Item {
       root.showCompleted = root.logic.asBool(root.service.settings.showCompletedInTop, false)
     root.opened = true
     root.ensureLoaded()
+    // The window opens at the top, which is where Accounts is, so `accounts` needs no scrolling — only the state:
+    // the providers from a 10-minute cache, the indexer add-ons read fresh (`openSettings`).
+    if (wantsSettings) root.openSettings(String(payload.from || "payload"))
     // `{"picker":{"mediaId":…,"episode":…}}` lands on the release picker (the popout's
     // button, `omarchy-shell omaanime picker`, and mpv's borrowed `p` after a refused auto-next).
     if (payload.picker && Number(payload.picker.mediaId) > 0 && Number(payload.picker.episode) > 0)
@@ -532,6 +600,10 @@ Item {
   }
 
   function close() {
+    if (root.settingsOpen) {
+      root.settingsAlone = false        // the host is closing everything already
+      root.closeSettings("host")
+    }
     root.opened = false
     root.playPending = false
   }
@@ -1590,7 +1662,8 @@ Item {
   // --------------------------------------------------------------------- surface
   PanelWindow {
     id: panel
-    visible: root.opened
+    // Hidden while Settings is up: a full-screen layer with exclusive focus would cover its window.
+    visible: root.opened && !root.settingsOpen
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "omaanime-browse"
@@ -1603,15 +1676,13 @@ Item {
       color: root.scrim
     }
 
-    // Click outside the card dismisses, like every Omarchy overlay — except while the settings
-    // sheet is open, where "click outside" should mean one level back, not "destroy the overlay
-    // I was one keystroke from returning to".
+    // Click outside the card dismisses, like every Omarchy overlay — except while the picker is open, where "click
+    // outside" should mean one level back, not "destroy the overlay I was one keystroke from returning to".
     MouseArea {
       anchors.fill: parent
       acceptedButtons: Qt.AllButtons
       onClicked: {
-        if (root.settingsOpen) root.closeSettings()
-        else if (root.pickerOpen) root.closePicker()
+        if (root.pickerOpen) root.closePicker()
         else root.dismiss()
       }
     }
@@ -1694,41 +1765,8 @@ Item {
             }
             return
           }
-          if (root.settingsOpen) {
-            // The sheet owns the keyboard: Tab walks the controls through Qt's own focus chain and
-            // every other key belongs to whichever control has focus. Escape and the scroll keys
-            // are handled both here and on settingsPane, because only one of the two has focus at
-            // any moment — keyCatcher before the first Tab, the pane's control chain after it.
-            switch (event.key) {
-            case Qt.Key_Escape:
-              root.closeSettings()
-              event.accepted = true
-              return
-            case Qt.Key_PageDown:
-            case Qt.Key_Down:
-            case Qt.Key_J:
-              root.scrollSheet(settingsFlick.height * (event.key === Qt.Key_PageDown ? 0.8 : 0.2))
-              event.accepted = true
-              return
-            case Qt.Key_PageUp:
-            case Qt.Key_Up:
-            case Qt.Key_K:
-              root.scrollSheet(-settingsFlick.height * (event.key === Qt.Key_PageUp ? 0.8 : 0.2))
-              event.accepted = true
-              return
-            case Qt.Key_Home:
-              root.scrollSheet(-settingsFlick.contentHeight)
-              event.accepted = true
-              return
-            case Qt.Key_End:
-              root.scrollSheet(settingsFlick.contentHeight)
-              event.accepted = true
-              return
-            }
-            return
-          }
-          // The waiting play's choices take their keys first, wherever the card is (but the picker and the sheet,
-          // which own the keyboard): the status line names them. Only a choice with a command has a key.
+          // The waiting play's choices take their keys first, wherever the card is (but the picker, which owns the
+          // keyboard): the status line names them. Only a choice with a command has a key.
           // In another show's detail view the view's keys win (`w` sets that show as watching).
           var chosen = root.choiceKeysHere ? Model.choiceForKey(root.playChoice, event.text) : null
           if (chosen) {
@@ -1737,7 +1775,7 @@ Item {
             return
           }
           if (event.key === Qt.Key_Comma) {
-            root.openSettings()
+            root.openSettings("browse")
             event.accepted = true
             return
           }
@@ -1926,7 +1964,7 @@ Item {
           anchors.left: parent.left
           anchors.right: parent.right
           spacing: Style.spacing.md
-          visible: !root.detailOpen && !root.settingsOpen && !root.pickerOpen
+          visible: !root.detailOpen && !root.pickerOpen
 
           // Tabs on the left, the keyboard-only actions on the right. Before this phase `r`, `c`
           // and `,` had no pointer route at all; the caption that advertised `c` was a plain Text.
@@ -2008,7 +2046,7 @@ Item {
                 accent: Commons.Color.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
-                onClicked: root.openSettings()
+                onClicked: root.openSettings("browse")
               }
             }
           }
@@ -2099,7 +2137,7 @@ Item {
           anchors.bottomMargin: Style.spacing.sm
           anchors.left: parent.left
           spacing: Style.spacing.sm
-          visible: !!root.playChoice && !root.pickerOpen && !root.settingsOpen
+          visible: !!root.playChoice && !root.pickerOpen
 
           Repeater {
             model: root.playChoice ? root.playChoice.buttons : []
@@ -2154,7 +2192,7 @@ Item {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           color: root.service && (root.service.lastError !== "" || root.service.notice !== ""
-                                  || root.bridge.notice !== "" || (root.settingsOpen && !!root.service.settingsError))
+                                  || root.bridge.notice !== "")
                  ? Commons.Color.accent : root.dim
           text: {
             if (!root.service) return "Service not loaded"
@@ -2163,7 +2201,7 @@ Item {
             // A play waiting for TorBox (or holding its choices): what TorBox is doing, then the choices' sentence.
             // Before `busy`, which stays "Finding a release…" while this Service's own play runs; after a play's
             // error, the restart notice and the standing notices, which outrank it.
-            if (root.playChoice && root.choiceKeysHere && !root.pickerOpen && !root.settingsOpen) {
+            if (root.playChoice && root.choiceKeysHere && !root.pickerOpen) {
               if (root.service.lastError !== "") return root.svc.errorHeadline() + "\n" + root.svc.errorDetail()
               if (root.bridge.notice !== "") return root.bridge.notice
               if (root.service.notice !== "") return root.service.notice
@@ -2174,8 +2212,6 @@ Item {
               return root.service.busy + (root.service.playRefusal ? "\n" + root.service.playRefusal : "")
             // The refusal is the picker's own summary line; down here, the keys.
             if (root.pickerOpen) return Model.pickerKeys(root.pickerData)
-            // A settings write that failed is said in the sheet, not as the play's error.
-            if (root.settingsOpen && root.service.settingsError) return String(root.service.settingsError)
             if (root.service.lastError !== "")
               return root.svc.errorHeadline() + "\n" + root.svc.errorDetail()
             // A play refused before it started (an entry that is not out yet): the CLI's sentence.
@@ -2185,8 +2221,6 @@ Item {
             if (root.bridge.notice !== "") return root.bridge.notice
             // A standing notice (token expiry, AniList budget).
             if (root.service.notice !== "") return root.service.notice
-            if (root.settingsOpen)
-              return "Tab moves between settings · j/k scrolls · every change is saved to shell.json · reset gives a key back to config.json · Escape goes back"
             if (root.detailOpen)
               return "Enter plays the selected episode · hjkl moves · p chooses a release · w sets it as watching · Escape goes back"
             if (root.view === "watching")
@@ -2412,1350 +2446,6 @@ Item {
           }
         }
 
-        // ------------------------------------------------------------- settings sheet
-        // **Omarchy 4.0.3 has no settings form**: `barWidget.schema` is
-        // copied into bar-widget registry metadata and never read again (one assignment at
-        // shell.qml:1408; no reader of `defaultValue` anywhere; `Ui/MultiSelect.qml` instantiated by
-        // zero files), and `omarchy-menu.jsonc` carries no per-widget settings route. So the plugin
-        // draws its own sheet — out of the manifest's own schema, so "what the manifest documents"
-        // and "what the sheet renders" stay the same list by construction.
-        Column {
-          id: settingsHead
-          anchors.top: parent.top
-          anchors.left: parent.left
-          anchors.right: parent.right
-          spacing: Style.spacing.sm
-          visible: root.settingsOpen
-
-          Item {
-            width: parent.width
-            height: Math.max(sheetTitles.height, sheetClose.height)
-
-            Row {
-              id: sheetTitles
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.spacing.md
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Settings"
-                textFormat: Text.PlainText
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.heading
-              }
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: "saved as you change them"
-                textFormat: Text.PlainText
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-
-            // Escape closes the sheet; the header was two Texts and the scrim tore the whole
-            // overlay down, so a mouse had no way back to the list one level up.
-            Button {
-              id: sheetClose
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              text: "✕"
-              tooltipText: "Back to the list (Esc)"
-              foreground: root.foreground
-              accent: Commons.Color.accent
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              onClicked: root.closeSettings()
-            }
-          }
-        }
-
-        Item {
-          id: settingsPane
-          anchors.top: settingsHead.bottom
-          anchors.topMargin: Style.spacing.md
-          anchors.bottom: statusLine.top
-          anchors.bottomMargin: Style.spacing.sm
-          anchors.left: parent.left
-          anchors.right: parent.right
-          visible: root.settingsOpen
-
-          readonly property Item focusedControl: settingsPane.Window.activeFocusItem
-          onFocusedControlChanged: root.revealInSheet(settingsPane.focusedControl)
-
-          // Escape from inside a control still closes the sheet: unhandled keys bubble up the focus
-          // chain to this ancestor, which keyCatcher no longer sees once a control has focus.
-          // PageUp/PageDown/Home/End scroll, because a SpinBox eats Up/Down and there is no
-          // guarantee of a pointer.
-          Keys.onPressed: function (event) {
-            switch (event.key) {
-            case Qt.Key_Escape:
-              root.closeSettings()
-              event.accepted = true
-              return
-            case Qt.Key_PageDown:
-              root.scrollSheet(settingsFlick.height * 0.8)
-              event.accepted = true
-              return
-            case Qt.Key_PageUp:
-              root.scrollSheet(-settingsFlick.height * 0.8)
-              event.accepted = true
-              return
-            case Qt.Key_Home:
-              root.scrollSheet(-settingsFlick.contentHeight)
-              event.accepted = true
-              return
-            case Qt.Key_End:
-              root.scrollSheet(settingsFlick.contentHeight)
-              event.accepted = true
-              return
-            }
-          }
-
-          Flickable {
-            id: settingsFlick
-            anchors.fill: parent
-            clip: true
-            contentWidth: width
-            contentHeight: settingsColumn.height
-            boundsBehavior: Flickable.StopAtBounds
-
-            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded; active: true }
-
-            Column {
-              id: settingsColumn
-              // A lane for the scrollbar, so a row's trailing button is never under the handle.
-              width: settingsFlick.width - Style.space(10)
-              spacing: Style.spacing.md
-
-              // ---------------------------------------------------------------- Accounts
-              Text {
-                width: parent.width
-                text: "Accounts"
-                textFormat: Text.PlainText
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.subtitle
-              }
-
-              Text {
-                width: parent.width
-                wrapMode: Text.Wrap
-                textFormat: Text.PlainText
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                text: root.service && root.service.accountsError !== ""
-                      ? root.service.accountsError
-                      : "A token is stored at ~/.config/omaanime/<provider>-token, mode 600, "
-                        + "and never anywhere else — not in Omarchy's shell.json, not in the log, "
-                        + "not on a command line."
-              }
-
-              Repeater {
-                model: root.accountProviders
-
-                Column {
-                  id: acctRow
-                  required property var modelData
-                  readonly property string provider: String(modelData)
-                  readonly property var state: root.account(provider)
-                  // `present` is absent until `accounts` has answered, and `visible` is a bool.
-                  readonly property bool connected: acctRow.state.present === true
-                  width: settingsColumn.width
-                  spacing: Style.space(4)
-
-                  Item {
-                    width: parent.width
-                    height: Math.max(acctText.height, acctActions.height)
-
-                    Column {
-                      id: acctText
-                      anchors.left: parent.left
-                      anchors.right: acctActions.left
-                      anchors.rightMargin: Style.spacing.md
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(1)
-
-                      Text {
-                        text: root.accountLabels[acctRow.provider] || acctRow.provider
-                        textFormat: Text.PlainText
-                        color: root.foreground
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.body
-                      }
-
-                      Text {
-                        width: parent.width
-                        text: root.accountLine(acctRow.provider)
-                        textFormat: Text.PlainText
-                        elide: Text.ElideRight
-                        color: root.accountColour(acctRow.provider)
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                      }
-                    }
-
-                    Row {
-                      id: acctActions
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(6)
-
-                      Button {
-                        anchors.verticalCenter: parent.verticalCenter
-                        focusable: true
-                        // No Cancel while TorBox's token is being checked and saved.
-                        visible: (!acctRow.connected || root.signingIn === acctRow.provider)
-                                 && !(acctRow.provider === "torbox" && root.signingIn === "torbox"
-                                      && !root.logic.deviceCancellable(root.torboxDevice))
-                        text: root.signingIn === acctRow.provider ? "Cancel" : "Sign in"
-                        bordered: true
-                        foreground: root.foreground
-                        accent: Commons.Color.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        onClicked: {
-                          if (root.signingIn === acctRow.provider) root.closeSignIn()
-                          else root.openSignIn(acctRow.provider)
-                        }
-                      }
-
-                      Button {
-                        anchors.verticalCenter: parent.verticalCenter
-                        focusable: true
-                        visible: acctRow.connected && root.signingIn !== acctRow.provider
-                        text: "Replace"
-                        tooltipText: acctRow.provider === "torbox" ? "Sign in again with a code"
-                                                                   : "Paste a new token for this provider"
-                        foreground: root.foreground
-                        accent: Commons.Color.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        onClicked: root.openSignIn(acctRow.provider)
-                      }
-
-                      // Two clicks, because this button sits next to twenty-three settings
-                      // controls. The confirm times out back to the first state after 5 s.
-                      Button {
-                        anchors.verticalCenter: parent.verticalCenter
-                        focusable: true
-                        visible: acctRow.connected && root.signingIn !== acctRow.provider
-                        text: root.confirmingOut === acctRow.provider ? "Really sign out?" : "Sign out"
-                        bordered: root.confirmingOut === acctRow.provider
-                        foreground: root.confirmingOut === acctRow.provider ? Commons.Color.accent : root.foreground
-                        accent: Commons.Color.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        onClicked: {
-                          if (root.confirmingOut === acctRow.provider) {
-                            root.confirmingOut = ""
-                            if (root.service) root.svc.signOut(acctRow.provider)
-                          } else {
-                            root.confirmingOut = acctRow.provider
-                            confirmTimer.restart()
-                          }
-                        }
-                      }
-                    }
-                  }
-
-                  // TorBox's device-code sign-in, in place. The code and the short URL are
-                  // the whole instruction; the QR code (from qrencode, an Omarchy base package)
-                  // opens the same approval page on a phone. Neither the device code nor the token
-                  // is ever in this sheet: the CLI does not print them.
-                  Row {
-                    width: parent.width
-                    spacing: Style.space(10)
-                    visible: acctRow.provider === "torbox" && root.signingIn === "torbox" && !root.torboxPaste
-
-                    // A light square with its quiet zone, whatever the theme, or scanners fail.
-                    Rectangle {
-                      id: qrBox
-                      readonly property var rows: root.torboxDevice.qr || []
-                      readonly property int size: rows.length
-                      readonly property int module: size > 0 ? Math.max(2, Math.floor(Style.space(120) / size)) : 0
-                      visible: size > 0 && root.torboxDevice.state === "waiting"
-                      width: size * module
-                      height: size * module
-                      color: "#ffffff"
-
-                      Grid {
-                        columns: qrBox.size
-                        Repeater {
-                          model: qrBox.visible ? qrBox.size * qrBox.size : 0
-                          Rectangle {
-                            required property int index
-                            width: qrBox.module
-                            height: qrBox.module
-                            color: String(qrBox.rows[Math.floor(index / qrBox.size)]).charAt(index % qrBox.size) === "1"
-                                   ? "#111111" : "transparent"
-                          }
-                        }
-                      }
-                    }
-
-                    Column {
-                      width: parent.width - (qrBox.visible ? qrBox.width + Style.space(10) : 0)
-                      spacing: Style.space(4)
-
-                      Text {
-                        width: parent.width
-                        visible: root.torboxDevice.state === "waiting"
-                        wrapMode: Text.Wrap
-                        textFormat: Text.PlainText
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        text: "Open " + (root.torboxDevice.url || "the page") + " and enter this code:"
-                      }
-
-                      Text {
-                        visible: root.torboxDevice.state === "waiting" && !!root.torboxDevice.code
-                        textFormat: Text.PlainText
-                        color: Commons.Color.accent
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.title
-                        font.letterSpacing: Style.space(2)
-                        text: String(root.torboxDevice.code || "")
-                      }
-
-                      Text {
-                        width: parent.width
-                        wrapMode: Text.Wrap
-                        textFormat: Text.PlainText
-                        color: root.torboxDevice.state === "expired" || root.torboxDevice.state === "denied"
-                               || root.torboxDevice.state === "failed" ? Commons.Color.accent : root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        text: root.logic.deviceStatusText(root.torboxDevice)
-                      }
-
-                      Row {
-                        spacing: Style.space(6)
-
-                        Button {
-                          focusable: true
-                          visible: root.torboxDevice.state === "waiting" && !!root.torboxDevice.verificationUrl
-                          text: "Open page"
-                          tooltipText: String(root.torboxDevice.url || "")
-                          bordered: true
-                          foreground: root.foreground
-                          accent: Commons.Color.accent
-                          fontFamily: root.fontFamily
-                          fontSize: Style.font.caption
-                          onClicked: Quickshell.execDetached(["xdg-open", String(root.torboxDevice.verificationUrl)])
-                        }
-
-                        Button {
-                          focusable: true
-                          visible: root.torboxDevice.state === "expired" || root.torboxDevice.state === "denied"
-                                   || root.torboxDevice.state === "failed" || root.torboxDevice.state === "cancelled"
-                          text: "Get a new code"
-                          bordered: true
-                          foreground: root.foreground
-                          accent: Commons.Color.accent
-                          fontFamily: root.fontFamily
-                          fontSize: Style.font.caption
-                          onClicked: if (root.service) root.svc.signInTorBoxDevice()
-                        }
-
-                        Button {
-                          focusable: true
-                          visible: root.logic.deviceCancellable(root.torboxDevice)
-                          text: "Paste a token instead"
-                          tooltipText: "The API token from torbox.app/settings"
-                          foreground: root.dim
-                          accent: Commons.Color.accent
-                          fontFamily: root.fontFamily
-                          fontSize: Style.font.caption
-                          onClicked: root.pasteTorBoxInstead()
-                        }
-                      }
-                    }
-                  }
-
-                  // The paste row, in place, only for the provider being signed in to. TorBox's
-                  // shows once "Paste a token instead" is chosen.
-                  Row {
-                    width: parent.width
-                    spacing: Style.space(6)
-                    visible: root.signingIn === acctRow.provider && (acctRow.provider !== "torbox" || root.torboxPaste)
-
-                    Button {
-                      id: openPage
-                      anchors.verticalCenter: parent.verticalCenter
-                      focusable: true
-                      text: "Open page"
-                      tooltipText: acctRow.state.signInUrl || ""
-                      bordered: true
-                      foreground: root.foreground
-                      accent: Commons.Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      // The URL comes from `accounts`, so the AniList client id is never rebuilt here.
-                      onClicked: if (acctRow.state.signInUrl)
-                        Quickshell.execDetached(["xdg-open", String(acctRow.state.signInUrl)])
-                    }
-
-                    TextField {
-                      id: tokenField
-                      anchors.verticalCenter: parent.verticalCenter
-                      // Measured from the buttons rather than a guessed constant: a hardcoded
-                      // reserve left "Clear clipboard" half off the card.
-                      width: Math.max(Style.space(80), parent.width - openPage.width - saveToken.width
-                                      - clearClip.width - Style.space(30))
-                      placeholderText: "paste the token"
-                      // Dots, not characters — and the value is never read into any log statement.
-                      echoMode: TextInput.Password
-                      foreground: root.foreground
-                      accent: Commons.Color.accent
-                      font.family: root.fontFamily
-                      onAccepted: saveToken.clicked()
-                    }
-
-                    Button {
-                      id: saveToken
-                      anchors.verticalCenter: parent.verticalCenter
-                      focusable: true
-                      text: "Save"
-                      bordered: true
-                      enabled: tokenField.text.length > 0
-                      opacity: enabled ? 1 : 0.35
-                      foreground: root.foreground
-                      accent: Commons.Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      onClicked: {
-                        if (tokenField.text.length === 0 || !root.service) return
-                        // Cleared only once the Service took it: a refused token stays for the next Save.
-                        var taken = root.svc.signIn(acctRow.provider, tokenField.text)
-                        if (taken !== true) {
-                          // The waiting note is for a busy refusal only; the Service says any other reason itself.
-                          root.signInWaiting = taken === "busy" ? acctRow.provider : ""
-                          return
-                        }
-                        root.signInWaiting = ""
-                        tokenField.text = ""            // consumed; gone from the field at once
-                        root.signingIn = ""
-                        root.torboxPaste = false
-                      }
-                    }
-
-                    Button {
-                      id: clearClip
-                      anchors.verticalCenter: parent.verticalCenter
-                      focusable: true
-                      text: "Clear clipboard"
-                      tooltipText: "wl-copy --clear — the token is probably still on it"
-                      foreground: root.dim
-                      accent: Commons.Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      onClicked: if (root.service) root.svc.clearClipboard()
-                    }
-                  }
-
-                  Text {
-                    width: parent.width
-                    visible: root.signInWaiting === acctRow.provider && root.signingIn === acctRow.provider
-                    text: Model.SIGN_IN_WAITING
-                    textFormat: Text.PlainText
-                    wrapMode: Text.Wrap
-                    color: Commons.Color.accent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-              }
-
-              // ---------------------------------------------------------------------- Torznab servers
-              // Your own Prowlarr or Jackett: add (address and API key, checked before it is saved), check, and
-              // remove (two clicks, like Sign out). The key field shows dots and is emptied the moment it is sent;
-              // a row shows at most the key's last four characters, as the CLI printed them.
-              Item { width: 1; height: Style.spacing.sm }
-
-              Item {
-                width: parent.width
-                height: Math.max(torznabHeading.height, torznabAddButton.height)
-
-                Text {
-                  id: torznabHeading
-                  anchors.left: parent.left
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: "Torznab servers"
-                  textFormat: Text.PlainText
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                }
-
-                Button {
-                  id: torznabAddButton
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  focusable: true
-                  visible: !root.torznabAdding
-                  enabled: root.torznabBusy === ""
-                  opacity: enabled ? 1 : 0.35
-                  text: "Add a server"
-                  tooltipText: "Your Prowlarr (its own address) or a Jackett or other Torznab feed URL, with its API key"
-                  bordered: true
-                  foreground: root.foreground
-                  accent: Commons.Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  onClicked: {
-                    root.torznabAdding = true
-                    root.torznabConfirm = ""
-                    if (root.service && "torznabAnswer" in root.service) root.service.torznabAnswer = null
-                  }
-                }
-              }
-
-              Text {
-                width: parent.width
-                wrapMode: Text.Wrap
-                textFormat: Text.PlainText
-                color: root.service && root.service.accounts && root.service.accounts.torznab
-                       && (root.service.accounts.torznab.problem
-                           || (root.service.accounts.torznab.skipped || []).length > 0)
-                          ? Commons.Color.accent : root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                text: root.torznabSection.caption
-                visible: text !== ""
-              }
-
-              // A Prowlarr or Jackett found running on this computer (only while the list is empty). The button
-              // opens the add row with its address filled in; the user pastes the key, and Add and check does the rest.
-              Repeater {
-                model: root.torznabOffers
-
-                Item {
-                  id: torznabOffer
-                  required property var modelData
-                  visible: !root.torznabAdding
-                  width: parent.width
-                  height: Math.max(torznabOfferText.height, torznabOfferUse.height)
-
-                  Column {
-                    id: torznabOfferText
-                    anchors.left: parent.left
-                    anchors.right: torznabOfferUse.left
-                    anchors.rightMargin: Style.space(8)
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: 2
-
-                    Text {
-                      width: parent.width
-                      wrapMode: Text.Wrap
-                      textFormat: Text.PlainText
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      text: String(torznabOffer.modelData.text)
-                    }
-
-                    Text {
-                      width: parent.width
-                      wrapMode: Text.Wrap
-                      textFormat: Text.PlainText
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      text: String(torznabOffer.modelData.where)
-                      visible: text !== ""
-                    }
-                  }
-
-                  Button {
-                    id: torznabOfferUse
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    focusable: true
-                    enabled: root.torznabBusy === ""
-                    opacity: enabled ? 1 : 0.35
-                    text: "Add " + String(torznabOffer.modelData.product)
-                    tooltipText: String(torznabOffer.modelData.address)
-                    bordered: true
-                    foreground: root.foreground
-                    accent: Commons.Color.accent
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: {
-                      if (root.service && "torznabAnswer" in root.service) root.service.torznabAnswer = null
-                      root.torznabConfirm = ""
-                      torznabUrlField.text = String(torznabOffer.modelData.address)
-                      torznabKeyField.text = ""
-                      root.torznabAdding = true
-                      Qt.callLater(function () { torznabKeyField.forceActiveFocus() })
-                    }
-                  }
-                }
-              }
-
-              // The add row: address, key (dots), Add and check, Cancel. The check runs in the Service's own
-              // process, so the sheet stays live while a server that does not answer is waited on.
-              Row {
-                width: parent.width
-                spacing: Style.space(6)
-                visible: root.torznabAdding
-
-                TextField {
-                  id: torznabUrlField
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Math.max(Style.space(80), (parent.width - torznabSave.width - torznabCancel.width
-                                                    - Style.space(24)) * 0.55)
-                  placeholderText: "http://host:9696, or a Torznab feed URL"
-                  foreground: root.foreground
-                  accent: Commons.Color.accent
-                  font.family: root.fontFamily
-                  onAccepted: torznabKeyField.forceActiveFocus()
-                }
-
-                TextField {
-                  id: torznabKeyField
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Math.max(Style.space(60), parent.width - torznabUrlField.width - torznabSave.width
-                                  - torznabCancel.width - Style.space(24))
-                  placeholderText: "API key"
-                  // Dots, not characters — and the value is never read into any log statement.
-                  echoMode: TextInput.Password
-                  foreground: root.foreground
-                  accent: Commons.Color.accent
-                  font.family: root.fontFamily
-                  onAccepted: torznabSave.clicked()
-                }
-
-                Button {
-                  id: torznabSave
-                  anchors.verticalCenter: parent.verticalCenter
-                  focusable: true
-                  text: "Add and check"
-                  bordered: true
-                  enabled: torznabUrlField.text.trim().length > 0 && root.torznabBusy === ""
-                  opacity: enabled ? 1 : 0.35
-                  foreground: root.foreground
-                  accent: Commons.Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  onClicked: {
-                    if (!enabled || !root.service) return
-                    if (root.svc.addTorznab(torznabUrlField.text, torznabKeyField.text)) {
-                      torznabKeyField.text = ""       // consumed; gone from the field at once
-                      torznabUrlField.text = ""
-                      root.torznabAdding = false
-                    }
-                  }
-                }
-
-                Button {
-                  id: torznabCancel
-                  anchors.verticalCenter: parent.verticalCenter
-                  focusable: true
-                  text: "Cancel"
-                  foreground: root.dim
-                  accent: Commons.Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  onClicked: {
-                    torznabKeyField.text = ""
-                    torznabUrlField.text = ""
-                    root.torznabAdding = false
-                  }
-                }
-              }
-
-              Text {
-                width: parent.width
-                wrapMode: Text.Wrap
-                textFormat: Text.PlainText
-                color: root.torznabBusy === "add" ? root.dim
-                       : root.service && root.service.torznabAnswer && root.service.torznabAnswer.saved !== true
-                         && root.service.torznabAnswer.removed !== false ? Commons.Color.accent : root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                text: root.torznabBusy === "add" ? "Checking the server before saving it (" + root.torznabWait + ")…"
-                      : root.service ? Model.torznabResultText(root.service.torznabAnswer) : ""
-                visible: text !== ""
-              }
-
-              Repeater {
-                model: root.torznabSection.rows
-
-                Column {
-                  id: torznabRow
-                  required property var modelData
-                  readonly property string rowId: String(modelData.id)
-                  readonly property bool checking: root.torznabBusy === "check:" + rowId
-                  width: settingsColumn.width
-                  spacing: Style.space(2)
-
-                  Item {
-                    width: parent.width
-                    height: Math.max(torznabText.height, torznabActions.height)
-
-                    Column {
-                      id: torznabText
-                      anchors.left: parent.left
-                      anchors.right: torznabActions.left
-                      anchors.rightMargin: Style.spacing.md
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(1)
-
-                      Text {
-                        width: parent.width
-                        text: String(torznabRow.modelData.title)
-                        textFormat: Text.PlainText
-                        elide: Text.ElideRight
-                        color: root.foreground
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.body
-                      }
-
-                      Text {
-                        width: parent.width
-                        text: String(torznabRow.modelData.line)
-                        textFormat: Text.PlainText
-                        wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                        color: torznabRow.modelData.bad ? Commons.Color.accent : root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                      }
-                    }
-
-                    Row {
-                      id: torznabActions
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(6)
-
-                      Button {
-                        anchors.verticalCenter: parent.verticalCenter
-                        focusable: true
-                        enabled: root.torznabBusy === ""
-                        opacity: enabled || torznabRow.checking ? 1 : 0.35
-                        text: torznabRow.checking ? "Checking…" : "Check"
-                        tooltipText: "Ask the server again what it is and which feeds it has"
-                        foreground: root.foreground
-                        accent: Commons.Color.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        onClicked: if (root.service) root.svc.checkTorznab(torznabRow.rowId, torznabRow.modelData.row)
-                      }
-
-                      Button {
-                        anchors.verticalCenter: parent.verticalCenter
-                        focusable: true
-                        enabled: root.torznabBusy === ""
-                        opacity: enabled ? 1 : 0.35
-                        text: root.torznabConfirm === torznabRow.rowId ? "Really remove?" : "Remove"
-                        bordered: root.torznabConfirm === torznabRow.rowId
-                        foreground: root.torznabConfirm === torznabRow.rowId ? Commons.Color.accent : root.foreground
-                        accent: Commons.Color.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        onClicked: {
-                          if (root.torznabConfirm === torznabRow.rowId) {
-                            root.torznabConfirm = ""
-                            if (root.service) root.svc.removeTorznab(torznabRow.rowId, torznabRow.modelData.row)
-                          } else {
-                            root.torznabConfirm = torznabRow.rowId
-                            torznabConfirmTimer.restart()
-                          }
-                        }
-                      }
-                    }
-                  }
-
-                  Text {
-                    width: parent.width
-                    visible: text !== ""
-                    wrapMode: Text.Wrap
-                    textFormat: Text.PlainText
-                    color: torznabRow.checking ? root.dim
-                           : torznabRow.modelData.checkBad ? Commons.Color.accent : root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    text: torznabRow.checking ? "Checking (" + root.torznabWait + ")…" : String(torznabRow.modelData.check)
-                  }
-
-                  Repeater {
-                    model: torznabRow.checking ? [] : torznabRow.modelData.checkLines
-
-                    Text {
-                      required property var modelData
-                      width: torznabRow.width
-                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                      textFormat: Text.PlainText
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      text: "· " + String(modelData)
-                    }
-                  }
-                }
-              }
-
-              // ---------------------------------------------------------------- Indexers
-              // The rows are text only; the reason a file did not load wraps, as it is the part a viewer has to read to
-              // fix it. The two AI agent buttons after them are the section's only stops for Tab.
-              Item { width: 1; height: Style.spacing.sm }
-
-              Text {
-                width: parent.width
-                text: "Indexers"
-                textFormat: Text.PlainText
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.subtitle
-              }
-
-              Text {
-                width: parent.width
-                wrapMode: Text.Wrap
-                textFormat: Text.PlainText
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                text: root.indexerSection.caption !== "" ? root.indexerSection.caption
-                      : !root.service ? ""
-                      : root.service.accountsLoading ? "reading…"
-                      : root.service.accountsError !== "" ? "The add-on status could not be read: " + root.service.accountsError
-                      : ""
-                visible: text !== ""
-              }
-
-              Repeater {
-                model: root.indexerSection.rows
-
-                Column {
-                  id: indexerRow
-                  required property var modelData
-                  // A loaded add-on reads plainly; a file that did not load, or a folder problem, in accent.
-                  readonly property bool ok: modelData.kind === "loaded"
-                  width: settingsColumn.width
-                  spacing: Style.space(1)
-
-                  Text {
-                    width: parent.width
-                    text: String(indexerRow.modelData.title)
-                    textFormat: Text.PlainText
-                    elide: Text.ElideRight
-                    color: indexerRow.ok ? root.foreground : Commons.Color.accent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                  }
-
-                  Text {
-                    width: parent.width
-                    text: String(indexerRow.modelData.detail)
-                    textFormat: Text.PlainText
-                    wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                    color: indexerRow.ok ? root.dim : Commons.Color.accent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-              }
-
-              Text {
-                width: parent.width
-                wrapMode: Text.Wrap
-                textFormat: Text.PlainText
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                text: Model.AGENT_CAPTION
-              }
-
-              Repeater {
-                model: root.agentRows
-
-                Column {
-                  id: agentRow
-                  required property var modelData
-                  width: settingsColumn.width
-                  spacing: Style.space(1)
-
-                  Button {
-                    focusable: true
-                    text: String(agentRow.modelData.label)
-                    bordered: true
-                    foreground: root.foreground
-                    accent: Commons.Color.accent
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: root.svc.askAgent(String(agentRow.modelData.kind))
-                  }
-
-                  Text {
-                    width: parent.width
-                    text: String(agentRow.modelData.detail)
-                    textFormat: Text.PlainText
-                    wrapMode: Text.Wrap
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  Text {
-                    width: parent.width
-                    text: String(agentRow.modelData.note)
-                    textFormat: Text.PlainText
-                    wrapMode: Text.Wrap
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    visible: text !== ""
-                  }
-                }
-              }
-
-              Item { width: 1; height: Style.spacing.sm }
-
-              Text {
-                width: parent.width
-                text: "Playback"
-                textFormat: Text.PlainText
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.subtitle
-              }
-
-              Repeater {
-                model: root.sheetRows
-
-                Column {
-                  id: settingRow
-                  required property var modelData
-                  readonly property string rowKey: String(modelData.key || "")
-                  readonly property string rowSource: root.settingSource(rowKey)
-                  width: settingsColumn.width
-                  spacing: Style.space(2)
-
-                  // One control per schema type. `boolean` is a Toggle (stateless — it emits
-                  // clicked() and we flip the value ourselves); anything with `options` is a
-                  // ButtonGroup up to three choices and a Dropdown beyond that; a bare `integer` is
-                  // a NumberField bounded by the schema's own min/max/step; a bare `string` is a
-                  // text field.
-                  Loader {
-                    width: parent.width
-                    sourceComponent: {
-                      if (settingRow.modelData.type === "boolean") return toggleControl
-                      if (settingRow.modelData.type === "list") return listControl
-                      var opts = settingRow.modelData.options
-                      if (opts && opts.length > 0) return opts.length > 3 ? dropdownControl : groupControl
-                      if (settingRow.modelData.type === "integer") return numberControl
-                      return textControl
-                    }
-                    onLoaded: item.row = settingRow.modelData
-                  }
-
-                  // Where this value comes from, and a way back. Shown only when it is not the
-                  // default, so the sheet stays quiet until precedence actually matters.
-                  Row {
-                    spacing: Style.spacing.sm
-                    visible: settingRow.rowSource !== "default"
-
-                    Text {
-                      anchors.verticalCenter: parent.verticalCenter
-                      text: root.sourceCaption(settingRow.rowKey)
-                      textFormat: Text.PlainText
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                    }
-
-                    Button {
-                      anchors.verticalCenter: parent.verticalCenter
-                      visible: settingRow.rowSource === "shell"
-                      text: "reset"
-                      tooltipText: "Drop this key from shell.json, back to config.json or the default"
-                      foreground: root.foreground
-                      accent: Commons.Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      onClicked: root.resetSetting(settingRow.rowKey)
-                    }
-                  }
-                }
-              }
-
-              Item { width: 1; height: Style.spacing.md }
-
-              // The disclosure header: clickable, Enter-able, and it says how many of the keys
-              // behind it are not at their default so a changed one is never hidden silently.
-              Row {
-                id: advancedHead
-                width: parent.width
-                spacing: Style.spacing.sm
-
-                Button {
-                  id: advancedToggle
-                  anchors.verticalCenter: parent.verticalCenter
-                  focusable: true
-                  text: (root.advancedOpen ? "\u25be  " : "\u25b8  ") + "Advanced \u00b7 "
-                        + root.advancedRows.length + " settings"
-                  tooltipText: "Indexer and provider order, fansub groups, budgets. Same store, same precedence."
-                  foreground: root.foreground
-                  accent: Commons.Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  onClicked: root.advancedOpen = !root.advancedOpen
-                  Keys.onPressed: function (event) {
-                    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
-                        || event.key === Qt.Key_Space) {
-                      root.advancedOpen = !root.advancedOpen
-                      event.accepted = true
-                    }
-                  }
-                }
-
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  visible: !root.advancedOpen && root.advancedChangedCount() > 0
-                  text: root.advancedChangedCount() + " changed"
-                  textFormat: Text.PlainText
-                  color: Commons.Color.accent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                Button {
-                  anchors.verticalCenter: parent.verticalCenter
-                  visible: root.advancedOpen && root.advancedChangedCount() > 0
-                  text: "reset all"
-                  tooltipText: "Drop every advanced key from shell.json in one write"
-                  foreground: root.foreground
-                  accent: Commons.Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  onClicked: root.resetAdvanced()
-                }
-              }
-
-              Text {
-                width: parent.width
-                visible: root.advancedOpen
-                wrapMode: Text.Wrap
-                textFormat: Text.PlainText
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                text: "Saved to Omarchy's shell.json like every other setting. "
-                      + (root.service ? root.service.configPath : "config.json")
-                      + " is still the middle layer: a key set there wins over the default and loses "
-                      + "to anything saved here, and reset hands the key back to it."
-              }
-
-              Repeater {
-                model: root.advancedOpen ? root.advancedRows : []
-
-                Column {
-                  id: advancedRow
-                  required property var modelData
-                  readonly property string rowKey: String(modelData.key || "")
-                  readonly property string rowSource: root.settingSource(rowKey)
-                  width: settingsColumn.width
-                  spacing: Style.space(2)
-
-                  Loader {
-                    width: parent.width
-                    sourceComponent: {
-                      if (advancedRow.modelData.type === "boolean") return toggleControl
-                      if (advancedRow.modelData.type === "list") return listControl
-                      var opts = advancedRow.modelData.options
-                      if (opts && opts.length > 0) return opts.length > 3 ? dropdownControl : groupControl
-                      if (advancedRow.modelData.type === "integer") return numberControl
-                      return textControl
-                    }
-                    onLoaded: item.row = advancedRow.modelData
-                  }
-
-                  Row {
-                    spacing: Style.spacing.sm
-                    visible: advancedRow.rowSource !== "default"
-
-                    Text {
-                      anchors.verticalCenter: parent.verticalCenter
-                      text: root.sourceCaption(advancedRow.rowKey)
-                      textFormat: Text.PlainText
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                    }
-
-                    Button {
-                      anchors.verticalCenter: parent.verticalCenter
-                      visible: advancedRow.rowSource === "shell"
-                      text: "reset"
-                      tooltipText: "Drop this key from shell.json, back to config.json or the default"
-                      foreground: root.foreground
-                      accent: Commons.Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      onClicked: root.resetSetting(advancedRow.rowKey)
-                    }
-                  }
-                }
-              }
-
-              Item { width: 1; height: Style.spacing.md }
-            }
-          }
-        }
-
-        // --- the control shapes the schema maps onto ------------------------------------
-        Component {
-          id: listControl
-          Column {
-            id: listCol
-            property var row: ({})
-            width: parent ? parent.width : 0
-            spacing: Style.space(4)
-
-            Text {
-              text: String(listCol.row.label || listCol.row.key || "")
-              textFormat: Text.PlainText
-              color: Qt.darker(root.foreground, 1.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-
-            OrderedList {
-              width: parent.width
-              values: root.settingValue(String(listCol.row.key || ""))
-              options: listCol.row.options ? listCol.row.options : []
-              foreground: root.foreground
-              dim: root.dim
-              fontFamily: root.fontFamily
-              readonly property var shape: Model.listRowShape(String(listCol.row.key || ""))
-              placeholder: shape.placeholder
-              addLabel: shape.addLabel
-              // Free-text rows check their entries per key (add-on names, group names);
-              // the fixed-option list needs no validator.
-              validator: (listCol.row.options && listCol.row.options.length > 0) ? null : shape.validator
-              // Stored comma-joined, because a JSON array does not survive the shell.json entry
-              // (measured; `core.as_list` is the Python half).
-              onChanged: function (values) {
-                root.writeSetting(String(listCol.row.key || ""), Model.joinList(values))
-              }
-            }
-
-            Text {
-              width: parent.width
-              visible: text !== ""
-              wrapMode: Text.Wrap
-              textFormat: Text.PlainText
-              text: String(listCol.row.description || "")
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-        }
-
-        Component {
-          id: toggleControl
-          Toggle {
-            property var row: ({})
-            width: parent ? parent.width : 0
-            label: String(row.label || row.key || "")
-            description: String(row.description || "")
-            checked: root.logic.asBool(root.settingValue(String(row.key || "")), false)   // "true" too
-            foreground: root.foreground
-            accent: Commons.Color.accent
-            fontFamily: root.fontFamily
-            // Ui/Toggle is stateless: it reports the click and we decide the new value.
-            onClicked: root.writeSetting(String(row.key || ""), !checked)
-          }
-        }
-
-        Component {
-          id: groupControl
-          Column {
-            property var row: ({})
-            width: parent ? parent.width : 0
-            spacing: Style.space(2)
-
-            Text {
-              text: String(parent.row.label || parent.row.key || "")
-              textFormat: Text.PlainText
-              color: Qt.darker(root.foreground, 1.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-
-            ButtonGroup {
-              options: parent.row.options || []
-              value: String(root.settingValue(String(parent.row.key || "")))
-              foreground: root.foreground
-              background: root.background
-              accent: Commons.Color.accent
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              // ButtonGroup speaks strings; an integer schema key has to arrive at shell.json as a
-              // number or `core.as_int` would be coercing a string on every read
-              // (`omarchy bar set` without --json stores "1", and bool("false") is true).
-              onChanged: function (v) {
-                root.writeSetting(String(parent.row.key || ""),
-                                  parent.row.type === "integer" ? parseInt(v, 10) : String(v))
-              }
-            }
-
-            Text {
-              width: parent.width
-              visible: !!parent.row.description
-              text: String(parent.row.description || "")
-              textFormat: Text.PlainText
-              wrapMode: Text.Wrap
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-        }
-
-        Component {
-          id: dropdownControl
-          Column {
-            id: menuControl
-            property var row: ({})
-            width: parent ? parent.width : 0
-            spacing: Style.space(2)
-            onRowChanged: root.noteMenu(menuControl.row)
-
-            Connections {
-              target: root
-              function onSettingsOpenChanged() { if (root.settingsOpen) root.noteMenu(menuControl.row) }
-            }
-
-            Dropdown {
-              width: Math.min(Style.space(260), parent.width)
-              label: String(parent.row.label || parent.row.key || "")
-              options: root.optionChoices(parent.row)
-              value: String(root.settingValue(String(parent.row.key || "")))
-              foreground: root.foreground
-              accent: Commons.Color.accent
-              fontFamily: root.fontFamily
-              onChanged: function (v) {
-                root.writeSetting(String(parent.row.key || ""),
-                                  parent.row.type === "integer" ? parseInt(v, 10) : String(v))
-              }
-            }
-
-            Text {
-              width: parent.width
-              visible: !!parent.row.description
-              text: String(parent.row.description || "")
-              textFormat: Text.PlainText
-              wrapMode: Text.Wrap
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-        }
-
-        Component {
-          id: numberControl
-          Column {
-            id: numberCol
-            property var row: ({})
-            width: parent ? parent.width : 0
-            spacing: Style.space(2)
-
-            // One key's control unit is not its stored unit: the subtitle cache is shown in MiB,
-            // because 16777216 is not a number anybody wants to type. Its schema min/max are in
-            // bytes, so they are converted too rather than duplicated. `null` for every other key.
-            readonly property var unit: root.byteUnitOf(String(numberCol.row.key || ""))
-            readonly property real factor: numberCol.unit ? Number(numberCol.unit.factor) : 1
-
-            NumberField {
-              label: String(numberCol.row.label || numberCol.row.key || "")
-                     + (numberCol.unit ? " — " + String(numberCol.unit.label) : "")
-              from: numberCol.row.min === undefined ? 0
-                    : (numberCol.unit ? Model.bytesToUnit(numberCol.row.min, numberCol.factor)
-                                      : Number(numberCol.row.min))
-              to: numberCol.row.max === undefined ? 1000
-                  : (numberCol.unit ? Model.bytesToUnit(numberCol.row.max, numberCol.factor)
-                                    : Number(numberCol.row.max))
-              stepSize: numberCol.row.step === undefined ? 1 : Number(numberCol.row.step)
-              value: {
-                var v = Number(root.settingValue(String(numberCol.row.key || ""))) || 0
-                return numberCol.unit ? Model.bytesToUnit(v, numberCol.factor) : v
-              }
-              foreground: root.foreground
-              accent: Commons.Color.accent
-              fontFamily: root.fontFamily
-              onModified: function (v) {
-                root.writeSetting(String(numberCol.row.key || ""),
-                                  numberCol.unit ? Model.unitToBytes(v, numberCol.factor) : Number(v))
-              }
-            }
-
-            Text {
-              width: parent.width
-              visible: !!numberCol.row.description
-              text: String(numberCol.row.description || "")
-              textFormat: Text.PlainText
-              wrapMode: Text.Wrap
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-        }
-
-        Component {
-          id: textControl
-          Column {
-            property var row: ({})
-            width: parent ? parent.width : 0
-            spacing: Style.space(2)
-
-            Text {
-              text: String(parent.row.label || parent.row.key || "")
-              textFormat: Text.PlainText
-              color: Qt.darker(root.foreground, 1.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-
-            TextField {
-              id: valueField
-              width: Math.min(Style.space(320), parent.width)
-              text: String(root.settingValue(String(parent.row.key || "")) || "")
-              // Empty is a setting, not a gap: the font follows the subtitle language.
-              placeholderText: parent.row.key === "subtitleFont" ? "Automatic: follows the subtitle language" : ""
-              foreground: root.foreground
-              accent: Commons.Color.accent
-              // Written on Enter or on focus loss, not on every keystroke: one shell.json write per
-              // typed character would rewrite the whole bar config thirty times for one font name.
-              // Trimmed, because a stray space is what a font-family lookup will not forgive and a
-              // Tab through the field is enough to produce one.
-              onAccepted: root.writeSetting(String(parent.row.key || ""), String(text).trim())
-              onActiveFocusChanged: if (!activeFocus) root.writeSetting(String(parent.row.key || ""), String(text).trim())
-            }
-
-            Text {
-              width: parent.width
-              visible: !!parent.row.description
-              text: String(parent.row.description || "")
-              textFormat: Text.PlainText
-              wrapMode: Text.Wrap
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-        }
-
         // ------------------------------------------------------------------ list
         Item {
           anchors.top: head.bottom
@@ -3764,7 +2454,7 @@ Item {
           anchors.bottomMargin: Style.spacing.sm
           anchors.left: parent.left
           anchors.right: parent.right
-          visible: !root.detailOpen && !root.settingsOpen && !root.pickerOpen
+          visible: !root.detailOpen && !root.pickerOpen
 
           // The rows are the saved list AniList's outage answered with: one dim line says why and from
           // when, above the rows it is about. Continue Watching's comes from the Service, each Lists status's, Top
@@ -4353,6 +3043,1473 @@ Item {
               return "No episodes to show"
             }
           }
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- settings window
+  // Settings (with Accounts and Advanced) is a normal window, not a sheet on the overlay: the overlay is a
+  // full-screen layer with exclusive keyboard focus, so a sign-in that needs the browser (TorBox's code, AniList's
+  // token, a Prowlarr or Jackett API key) had to close the plugin to get there. Hyprland can move this one, Alt-Tab
+  // reaches it, and it can sit beside the browser while the browser takes the typing. The overlay hides while it is
+  // up and comes back when it closes, if it was showing before (`settingsAlone` is false then).
+  //
+  // It lives in this file, not the Service, because the sheet's state and every control's binding are Browse's; the
+  // host keeps this file loaded while `opened` is true (shell.qml's panel Loader, no `keepLoaded`), which it stays
+  // while only this window is up. The host loads this file once, whatever the number of screens: one window.
+  FloatingWindow {
+    id: settingsWindow
+    title: "Anime \u00b7 Settings"
+    // A FloatingWindow is visible by default; this one is shown and hidden by `settingsShown` alone.
+    visible: false
+    color: root.background
+    implicitWidth: Style.space(760)
+    implicitHeight: Math.min(Style.space(860), Math.round((settingsWindow.screen ? settingsWindow.screen.height
+                                                                                   : Style.space(960)) * 0.85))
+    // A fixed size: Hyprland floats a window whose minimum and maximum are the same (Mixtape's player does this).
+    minimumSize: Qt.size(implicitWidth, implicitHeight)
+    maximumSize: Qt.size(implicitWidth, implicitHeight)
+    // Closed by the compositor (Super+W, a close from the window list): the same as ✕. Not sent on `visible = false`.
+    onClosed: root.closeSettings("window")
+
+    Item {
+      id: settingsKeys
+      anchors.fill: parent
+      focus: true
+
+      // The sheet owns the keyboard: Tab walks the controls through Qt's own focus chain and every other key belongs
+      // to whichever control has focus. Escape and the scroll keys are handled both here and on settingsPane,
+      // because only one of the two has focus at any moment — this item before the first Tab, the pane's control
+      // chain after it.
+      Keys.onPressed: function (event) {
+        switch (event.key) {
+        case Qt.Key_Escape:
+          root.closeSettings("escape")
+          event.accepted = true
+          return
+        case Qt.Key_PageDown:
+        case Qt.Key_Down:
+        case Qt.Key_J:
+          root.scrollSheet(settingsFlick.height * (event.key === Qt.Key_PageDown ? 0.8 : 0.2))
+          event.accepted = true
+          return
+        case Qt.Key_PageUp:
+        case Qt.Key_Up:
+        case Qt.Key_K:
+          root.scrollSheet(-settingsFlick.height * (event.key === Qt.Key_PageUp ? 0.8 : 0.2))
+          event.accepted = true
+          return
+        case Qt.Key_Home:
+          root.scrollSheet(-settingsFlick.contentHeight)
+          event.accepted = true
+          return
+        case Qt.Key_End:
+          root.scrollSheet(settingsFlick.contentHeight)
+          event.accepted = true
+          return
+        }
+      }
+
+      Item {
+        anchors.fill: parent
+        anchors.margins: Style.spacing.panelPadding
+        // ------------------------------------------------------------- the window's content
+        // **Omarchy 4.0.3 has no settings form**: `barWidget.schema` is
+        // copied into bar-widget registry metadata and never read again (one assignment at
+        // shell.qml:1408; no reader of `defaultValue` anywhere; `Ui/MultiSelect.qml` instantiated by
+        // zero files), and `omarchy-menu.jsonc` carries no per-widget settings route. So the plugin
+        // draws its own sheet — out of the manifest's own schema, so "what the manifest documents"
+        // and "what the sheet renders" stay the same list by construction.
+        Column {
+          id: settingsHead
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          spacing: Style.spacing.sm
+          visible: root.settingsOpen
+
+          Item {
+            width: parent.width
+            height: Math.max(sheetTitles.height, sheetClose.height)
+
+            // Dragging the header moves the window, as a title bar would (Super+drag does too).
+            MouseArea {
+              anchors.fill: parent
+              anchors.rightMargin: sheetClose.width + Style.spacing.md
+              cursorShape: Qt.SizeAllCursor
+              onPressed: settingsWindow.startSystemMove()
+            }
+
+            Row {
+              id: sheetTitles
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.spacing.md
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Settings"
+                textFormat: Text.PlainText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: "saved as you change them"
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            // Escape closes the window, and so does this: a mouse needs a way out too (the header was two Texts once).
+            Button {
+              id: sheetClose
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: "✕"
+              tooltipText: root.settingsAlone ? "Close (Esc)" : "Back to the list (Esc)"
+              foreground: root.foreground
+              accent: Commons.Color.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              onClicked: root.closeSettings("button")
+            }
+          }
+        }
+
+        Item {
+          id: settingsPane
+          anchors.top: settingsHead.bottom
+          anchors.topMargin: Style.spacing.md
+          anchors.bottom: settingsStatus.top
+          anchors.bottomMargin: Style.spacing.sm
+          anchors.left: parent.left
+          anchors.right: parent.right
+          visible: root.settingsOpen
+
+          readonly property Item focusedControl: settingsPane.Window.activeFocusItem
+          onFocusedControlChanged: root.revealInSheet(settingsPane.focusedControl)
+
+          // Escape from inside a control still closes the window: unhandled keys bubble up the focus
+          // chain to this ancestor, which settingsKeys no longer sees once a control has focus.
+          // PageUp/PageDown/Home/End scroll, because a SpinBox eats Up/Down and there is no
+          // guarantee of a pointer.
+          Keys.onPressed: function (event) {
+            switch (event.key) {
+            case Qt.Key_Escape:
+              root.closeSettings("escape")
+              event.accepted = true
+              return
+            case Qt.Key_PageDown:
+              root.scrollSheet(settingsFlick.height * 0.8)
+              event.accepted = true
+              return
+            case Qt.Key_PageUp:
+              root.scrollSheet(-settingsFlick.height * 0.8)
+              event.accepted = true
+              return
+            case Qt.Key_Home:
+              root.scrollSheet(-settingsFlick.contentHeight)
+              event.accepted = true
+              return
+            case Qt.Key_End:
+              root.scrollSheet(settingsFlick.contentHeight)
+              event.accepted = true
+              return
+            }
+          }
+
+          Flickable {
+            id: settingsFlick
+            anchors.fill: parent
+            clip: true
+            contentWidth: width
+            contentHeight: settingsColumn.height
+            boundsBehavior: Flickable.StopAtBounds
+
+            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded; active: true }
+
+            Column {
+              id: settingsColumn
+              // A lane for the scrollbar, so a row's trailing button is never under the handle.
+              width: settingsFlick.width - Style.space(10)
+              spacing: Style.spacing.md
+
+              // ---------------------------------------------------------------- Accounts
+              Text {
+                width: parent.width
+                text: "Accounts"
+                textFormat: Text.PlainText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.subtitle
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                text: root.service && root.service.accountsError !== ""
+                      ? root.service.accountsError
+                      : "A token is stored at ~/.config/omaanime/<provider>-token, mode 600, "
+                        + "and never anywhere else — not in Omarchy's shell.json, not in the log, "
+                        + "not on a command line."
+              }
+
+              Repeater {
+                model: root.accountProviders
+
+                Column {
+                  id: acctRow
+                  required property var modelData
+                  readonly property string provider: String(modelData)
+                  readonly property var state: root.account(provider)
+                  // `present` is absent until `accounts` has answered, and `visible` is a bool.
+                  readonly property bool connected: acctRow.state.present === true
+                  width: settingsColumn.width
+                  spacing: Style.space(4)
+
+                  Item {
+                    width: parent.width
+                    height: Math.max(acctText.height, acctActions.height)
+
+                    Column {
+                      id: acctText
+                      anchors.left: parent.left
+                      anchors.right: acctActions.left
+                      anchors.rightMargin: Style.spacing.md
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(1)
+
+                      Text {
+                        text: root.accountLabels[acctRow.provider] || acctRow.provider
+                        textFormat: Text.PlainText
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+
+                      Text {
+                        width: parent.width
+                        text: root.accountLine(acctRow.provider)
+                        textFormat: Text.PlainText
+                        elide: Text.ElideRight
+                        color: root.accountColour(acctRow.provider)
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    Row {
+                      id: acctActions
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+
+                      Button {
+                        anchors.verticalCenter: parent.verticalCenter
+                        focusable: true
+                        // No Cancel while TorBox's token is being checked and saved.
+                        visible: (!acctRow.connected || root.signingIn === acctRow.provider)
+                                 && !(acctRow.provider === "torbox" && root.signingIn === "torbox"
+                                      && !root.logic.deviceCancellable(root.torboxDevice))
+                        text: root.signingIn === acctRow.provider ? "Cancel" : "Sign in"
+                        bordered: true
+                        foreground: root.foreground
+                        accent: Commons.Color.accent
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: {
+                          if (root.signingIn === acctRow.provider) root.closeSignIn()
+                          else root.openSignIn(acctRow.provider)
+                        }
+                      }
+
+                      Button {
+                        anchors.verticalCenter: parent.verticalCenter
+                        focusable: true
+                        visible: acctRow.connected && root.signingIn !== acctRow.provider
+                        text: "Replace"
+                        tooltipText: acctRow.provider === "torbox" ? "Sign in again with a code"
+                                                                   : "Paste a new token for this provider"
+                        foreground: root.foreground
+                        accent: Commons.Color.accent
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: root.openSignIn(acctRow.provider)
+                      }
+
+                      // Two clicks, because this button sits next to twenty-three settings
+                      // controls. The confirm times out back to the first state after 5 s.
+                      Button {
+                        anchors.verticalCenter: parent.verticalCenter
+                        focusable: true
+                        visible: acctRow.connected && root.signingIn !== acctRow.provider
+                        text: root.confirmingOut === acctRow.provider ? "Really sign out?" : "Sign out"
+                        bordered: root.confirmingOut === acctRow.provider
+                        foreground: root.confirmingOut === acctRow.provider ? Commons.Color.accent : root.foreground
+                        accent: Commons.Color.accent
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: {
+                          if (root.confirmingOut === acctRow.provider) {
+                            root.confirmingOut = ""
+                            if (root.service) root.svc.signOut(acctRow.provider)
+                          } else {
+                            root.confirmingOut = acctRow.provider
+                            confirmTimer.restart()
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // TorBox's device-code sign-in, in place. The code and the short URL are
+                  // the whole instruction; the QR code (from qrencode, an Omarchy base package)
+                  // opens the same approval page on a phone. Neither the device code nor the token
+                  // is ever in this sheet: the CLI does not print them.
+                  Row {
+                    width: parent.width
+                    spacing: Style.space(10)
+                    visible: acctRow.provider === "torbox" && root.signingIn === "torbox" && !root.torboxPaste
+
+                    // A light square with its quiet zone, whatever the theme, or scanners fail.
+                    Rectangle {
+                      id: qrBox
+                      readonly property var rows: root.torboxDevice.qr || []
+                      readonly property int size: rows.length
+                      readonly property int module: size > 0 ? Math.max(2, Math.floor(Style.space(120) / size)) : 0
+                      visible: size > 0 && root.torboxDevice.state === "waiting"
+                      width: size * module
+                      height: size * module
+                      color: "#ffffff"
+
+                      Grid {
+                        columns: qrBox.size
+                        Repeater {
+                          model: qrBox.visible ? qrBox.size * qrBox.size : 0
+                          Rectangle {
+                            required property int index
+                            width: qrBox.module
+                            height: qrBox.module
+                            color: String(qrBox.rows[Math.floor(index / qrBox.size)]).charAt(index % qrBox.size) === "1"
+                                   ? "#111111" : "transparent"
+                          }
+                        }
+                      }
+                    }
+
+                    Column {
+                      width: parent.width - (qrBox.visible ? qrBox.width + Style.space(10) : 0)
+                      spacing: Style.space(4)
+
+                      Text {
+                        width: parent.width
+                        visible: root.torboxDevice.state === "waiting"
+                        wrapMode: Text.Wrap
+                        textFormat: Text.PlainText
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        text: "Open " + (root.torboxDevice.url || "the page") + " and enter this code:"
+                      }
+
+                      Text {
+                        visible: root.torboxDevice.state === "waiting" && !!root.torboxDevice.code
+                        textFormat: Text.PlainText
+                        color: Commons.Color.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.title
+                        font.letterSpacing: Style.space(2)
+                        text: String(root.torboxDevice.code || "")
+                      }
+
+                      // The Service put the code on the clipboard when it showed (`copyDeviceCode`).
+                      Text {
+                        width: parent.width
+                        visible: root.torboxDevice.state === "waiting" && !!root.torboxDevice.code && text !== ""
+                        wrapMode: Text.Wrap
+                        textFormat: Text.PlainText
+                        color: root.service && root.service.torboxCodeClip === "failed" ? Commons.Color.accent
+                                                                                       : root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        text: Model.deviceClipText(root.service ? root.service.torboxCodeClip : "")
+                      }
+
+                      Text {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        textFormat: Text.PlainText
+                        color: root.torboxDevice.state === "expired" || root.torboxDevice.state === "denied"
+                               || root.torboxDevice.state === "failed" ? Commons.Color.accent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        text: root.logic.deviceStatusText(root.torboxDevice)
+                      }
+
+                      Row {
+                        spacing: Style.space(6)
+
+                        Button {
+                          focusable: true
+                          visible: root.torboxDevice.state === "waiting" && !!root.torboxDevice.verificationUrl
+                          text: "Open page"
+                          tooltipText: String(root.torboxDevice.url || "")
+                          bordered: true
+                          foreground: root.foreground
+                          accent: Commons.Color.accent
+                          fontFamily: root.fontFamily
+                          fontSize: Style.font.caption
+                          onClicked: Quickshell.execDetached(["xdg-open", String(root.torboxDevice.verificationUrl)])
+                        }
+
+                        Button {
+                          focusable: true
+                          visible: root.torboxDevice.state === "expired" || root.torboxDevice.state === "denied"
+                                   || root.torboxDevice.state === "failed" || root.torboxDevice.state === "cancelled"
+                          text: "Get a new code"
+                          bordered: true
+                          foreground: root.foreground
+                          accent: Commons.Color.accent
+                          fontFamily: root.fontFamily
+                          fontSize: Style.font.caption
+                          onClicked: if (root.service) root.svc.signInTorBoxDevice()
+                        }
+
+                        Button {
+                          focusable: true
+                          visible: root.logic.deviceCancellable(root.torboxDevice)
+                          text: "Paste a token instead"
+                          tooltipText: "The API token from torbox.app/settings"
+                          foreground: root.dim
+                          accent: Commons.Color.accent
+                          fontFamily: root.fontFamily
+                          fontSize: Style.font.caption
+                          onClicked: root.pasteTorBoxInstead()
+                        }
+                      }
+                    }
+                  }
+
+                  // The paste row, in place, only for the provider being signed in to. TorBox's
+                  // shows once "Paste a token instead" is chosen.
+                  Row {
+                    width: parent.width
+                    spacing: Style.space(6)
+                    visible: root.signingIn === acctRow.provider && (acctRow.provider !== "torbox" || root.torboxPaste)
+
+                    Button {
+                      id: openPage
+                      anchors.verticalCenter: parent.verticalCenter
+                      focusable: true
+                      text: "Open page"
+                      tooltipText: acctRow.state.signInUrl || ""
+                      bordered: true
+                      foreground: root.foreground
+                      accent: Commons.Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      // The URL comes from `accounts`, so the AniList client id is never rebuilt here.
+                      onClicked: if (acctRow.state.signInUrl)
+                        Quickshell.execDetached(["xdg-open", String(acctRow.state.signInUrl)])
+                    }
+
+                    TextField {
+                      id: tokenField
+                      anchors.verticalCenter: parent.verticalCenter
+                      // Measured from the buttons rather than a guessed constant: a hardcoded
+                      // reserve left "Clear clipboard" half off the card.
+                      width: Math.max(Style.space(80), parent.width - openPage.width - saveToken.width
+                                      - clearClip.width - Style.space(30))
+                      placeholderText: "paste the token"
+                      // Dots, not characters — and the value is never read into any log statement.
+                      echoMode: TextInput.Password
+                      foreground: root.foreground
+                      accent: Commons.Color.accent
+                      font.family: root.fontFamily
+                      onAccepted: saveToken.clicked()
+                    }
+
+                    Button {
+                      id: saveToken
+                      anchors.verticalCenter: parent.verticalCenter
+                      focusable: true
+                      text: "Save"
+                      bordered: true
+                      enabled: tokenField.text.length > 0
+                      opacity: enabled ? 1 : 0.35
+                      foreground: root.foreground
+                      accent: Commons.Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: {
+                        if (tokenField.text.length === 0 || !root.service) return
+                        // Cleared only once the Service took it: a refused token stays for the next Save.
+                        var taken = root.svc.signIn(acctRow.provider, tokenField.text)
+                        if (taken !== true) {
+                          // The waiting note is for a busy refusal only; the Service says any other reason itself.
+                          root.signInWaiting = taken === "busy" ? acctRow.provider : ""
+                          return
+                        }
+                        root.signInWaiting = ""
+                        tokenField.text = ""            // consumed; gone from the field at once
+                        root.signingIn = ""
+                        root.torboxPaste = false
+                      }
+                    }
+
+                    Button {
+                      id: clearClip
+                      anchors.verticalCenter: parent.verticalCenter
+                      focusable: true
+                      text: "Clear clipboard"
+                      tooltipText: "wl-copy --clear — the token is probably still on it"
+                      foreground: root.dim
+                      accent: Commons.Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: if (root.service) root.svc.clearClipboard()
+                    }
+                  }
+
+                  Text {
+                    width: parent.width
+                    visible: root.signInWaiting === acctRow.provider && root.signingIn === acctRow.provider
+                    text: Model.SIGN_IN_WAITING
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    color: Commons.Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+
+              // ---------------------------------------------------------------------- Torznab servers
+              // Your own Prowlarr or Jackett: add (address and API key, checked before it is saved), check, and
+              // remove (two clicks, like Sign out). The key field shows dots and is emptied the moment it is sent;
+              // a row shows at most the key's last four characters, as the CLI printed them.
+              Item { width: 1; height: Style.spacing.sm }
+
+              Item {
+                width: parent.width
+                height: Math.max(torznabHeading.height, torznabAddButton.height)
+
+                Text {
+                  id: torznabHeading
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Torznab servers"
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                Button {
+                  id: torznabAddButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  focusable: true
+                  visible: !root.torznabAdding
+                  enabled: root.torznabBusy === ""
+                  opacity: enabled ? 1 : 0.35
+                  text: "Add a server"
+                  tooltipText: "Your Prowlarr (its own address) or a Jackett or other Torznab feed URL, "
+                               + "with its API key"
+                  bordered: true
+                  foreground: root.foreground
+                  accent: Commons.Color.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: {
+                    root.torznabAdding = true
+                    root.torznabConfirm = ""
+                    if (root.service && "torznabAnswer" in root.service) root.service.torznabAnswer = null
+                  }
+                }
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                color: root.service && root.service.accounts && root.service.accounts.torznab
+                       && (root.service.accounts.torznab.problem
+                           || (root.service.accounts.torznab.skipped || []).length > 0)
+                          ? Commons.Color.accent : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                text: root.torznabSection.caption
+                visible: text !== ""
+              }
+
+              // A Prowlarr or Jackett found running on this computer and not listed yet. The button
+              // opens the add row with its address filled in; the user pastes the key, and Add and check does the rest.
+              Repeater {
+                model: root.torznabOffers
+
+                Item {
+                  id: torznabOffer
+                  required property var modelData
+                  visible: !root.torznabAdding
+                  width: parent.width
+                  height: Math.max(torznabOfferText.height, torznabOfferUse.height)
+
+                  Column {
+                    id: torznabOfferText
+                    anchors.left: parent.left
+                    anchors.right: torznabOfferUse.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 2
+
+                    Text {
+                      width: parent.width
+                      wrapMode: Text.Wrap
+                      textFormat: Text.PlainText
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      text: String(torznabOffer.modelData.text)
+                    }
+
+                    Text {
+                      width: parent.width
+                      wrapMode: Text.Wrap
+                      textFormat: Text.PlainText
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      text: String(torznabOffer.modelData.where)
+                      visible: text !== ""
+                    }
+                  }
+
+                  Button {
+                    id: torznabOfferUse
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    focusable: true
+                    enabled: root.torznabBusy === ""
+                    opacity: enabled ? 1 : 0.35
+                    text: "Add " + String(torznabOffer.modelData.product)
+                    tooltipText: String(torznabOffer.modelData.address)
+                    bordered: true
+                    foreground: root.foreground
+                    accent: Commons.Color.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: {
+                      if (root.service && "torznabAnswer" in root.service) root.service.torznabAnswer = null
+                      root.torznabConfirm = ""
+                      torznabUrlField.text = String(torznabOffer.modelData.address)
+                      torznabKeyField.text = ""
+                      root.torznabAdding = true
+                      Qt.callLater(function () { torznabKeyField.forceActiveFocus() })
+                    }
+                  }
+                }
+              }
+
+              // The add row: address, key (dots), Add and check, Cancel. The check runs in the Service's own
+              // process, so the sheet stays live while a server that does not answer is waited on.
+              Row {
+                width: parent.width
+                spacing: Style.space(6)
+                visible: root.torznabAdding
+
+                TextField {
+                  id: torznabUrlField
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Math.max(Style.space(80), (parent.width - torznabSave.width - torznabCancel.width
+                                                    - Style.space(24)) * 0.55)
+                  placeholderText: "http://host:9696, or a Torznab feed URL"
+                  foreground: root.foreground
+                  accent: Commons.Color.accent
+                  font.family: root.fontFamily
+                  onAccepted: torznabKeyField.forceActiveFocus()
+                }
+
+                TextField {
+                  id: torznabKeyField
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Math.max(Style.space(60), parent.width - torznabUrlField.width - torznabSave.width
+                                  - torznabCancel.width - Style.space(24))
+                  placeholderText: "API key"
+                  // Dots, not characters — and the value is never read into any log statement.
+                  echoMode: TextInput.Password
+                  foreground: root.foreground
+                  accent: Commons.Color.accent
+                  font.family: root.fontFamily
+                  onAccepted: torznabSave.clicked()
+                }
+
+                Button {
+                  id: torznabSave
+                  anchors.verticalCenter: parent.verticalCenter
+                  focusable: true
+                  text: "Add and check"
+                  bordered: true
+                  enabled: torznabUrlField.text.trim().length > 0 && root.torznabBusy === ""
+                  opacity: enabled ? 1 : 0.35
+                  foreground: root.foreground
+                  accent: Commons.Color.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: {
+                    if (!enabled || !root.service) return
+                    if (root.svc.addTorznab(torznabUrlField.text, torznabKeyField.text)) {
+                      torznabKeyField.text = ""       // consumed; gone from the field at once
+                      torznabUrlField.text = ""
+                      root.torznabAdding = false
+                    }
+                  }
+                }
+
+                Button {
+                  id: torznabCancel
+                  anchors.verticalCenter: parent.verticalCenter
+                  focusable: true
+                  text: "Cancel"
+                  foreground: root.dim
+                  accent: Commons.Color.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: {
+                    torznabKeyField.text = ""
+                    torznabUrlField.text = ""
+                    root.torznabAdding = false
+                  }
+                }
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                color: root.torznabBusy === "add" ? root.dim
+                       : root.service && root.service.torznabAnswer && root.service.torznabAnswer.saved !== true
+                         && root.service.torznabAnswer.removed !== false ? Commons.Color.accent : root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                text: root.torznabBusy === "add" ? "Checking the server before saving it (" + root.torznabWait + ")…"
+                      : root.service ? Model.torznabResultText(root.service.torznabAnswer) : ""
+                visible: text !== ""
+              }
+
+              Repeater {
+                model: root.torznabSection.rows
+
+                Column {
+                  id: torznabRow
+                  required property var modelData
+                  readonly property string rowId: String(modelData.id)
+                  readonly property bool checking: root.torznabBusy === "check:" + rowId
+                  width: settingsColumn.width
+                  spacing: Style.space(2)
+
+                  Item {
+                    width: parent.width
+                    height: Math.max(torznabText.height, torznabActions.height)
+
+                    Column {
+                      id: torznabText
+                      anchors.left: parent.left
+                      anchors.right: torznabActions.left
+                      anchors.rightMargin: Style.spacing.md
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(1)
+
+                      Text {
+                        width: parent.width
+                        text: String(torznabRow.modelData.title)
+                        textFormat: Text.PlainText
+                        elide: Text.ElideRight
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+
+                      Text {
+                        width: parent.width
+                        text: String(torznabRow.modelData.line)
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                        color: torznabRow.modelData.bad ? Commons.Color.accent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    Row {
+                      id: torznabActions
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+
+                      Button {
+                        anchors.verticalCenter: parent.verticalCenter
+                        focusable: true
+                        enabled: root.torznabBusy === ""
+                        opacity: enabled || torznabRow.checking ? 1 : 0.35
+                        text: torznabRow.checking ? "Checking…" : "Check"
+                        tooltipText: "Ask the server again what it is and which feeds it has"
+                        foreground: root.foreground
+                        accent: Commons.Color.accent
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: if (root.service) root.svc.checkTorznab(torznabRow.rowId, torznabRow.modelData.row)
+                      }
+
+                      Button {
+                        anchors.verticalCenter: parent.verticalCenter
+                        focusable: true
+                        enabled: root.torznabBusy === ""
+                        opacity: enabled ? 1 : 0.35
+                        text: root.torznabConfirm === torznabRow.rowId ? "Really remove?" : "Remove"
+                        bordered: root.torznabConfirm === torznabRow.rowId
+                        foreground: root.torznabConfirm === torznabRow.rowId ? Commons.Color.accent : root.foreground
+                        accent: Commons.Color.accent
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: {
+                          if (root.torznabConfirm === torznabRow.rowId) {
+                            root.torznabConfirm = ""
+                            if (root.service) root.svc.removeTorznab(torznabRow.rowId, torznabRow.modelData.row)
+                          } else {
+                            root.torznabConfirm = torznabRow.rowId
+                            torznabConfirmTimer.restart()
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  Text {
+                    width: parent.width
+                    visible: text !== ""
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    color: torznabRow.checking ? root.dim
+                           : torznabRow.modelData.checkBad ? Commons.Color.accent : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    text: torznabRow.checking ? "Checking (" + root.torznabWait + ")…"
+                                              : String(torznabRow.modelData.check)
+                  }
+
+                  Repeater {
+                    model: torznabRow.checking ? [] : torznabRow.modelData.checkLines
+
+                    Text {
+                      required property var modelData
+                      width: torznabRow.width
+                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                      textFormat: Text.PlainText
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      text: "· " + String(modelData)
+                    }
+                  }
+                }
+              }
+
+              // ---------------------------------------------------------------- Indexers
+              // The rows are text only; the reason a file did not load wraps, as it is the part a viewer has to read to
+              // fix it. The two AI agent buttons after them are the section's only stops for Tab.
+              Item { width: 1; height: Style.spacing.sm }
+
+              Text {
+                width: parent.width
+                text: "Indexers"
+                textFormat: Text.PlainText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.subtitle
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                text: root.indexerSection.caption !== "" ? root.indexerSection.caption
+                      : !root.service ? ""
+                      : root.service.accountsLoading ? "reading…"
+                      : root.service.accountsError !== ""
+                        ? "The add-on status could not be read: " + root.service.accountsError
+                      : ""
+                visible: text !== ""
+              }
+
+              Repeater {
+                model: root.indexerSection.rows
+
+                Column {
+                  id: indexerRow
+                  required property var modelData
+                  // A loaded add-on reads plainly; a file that did not load, or a folder problem, in accent.
+                  readonly property bool ok: modelData.kind === "loaded"
+                  width: settingsColumn.width
+                  spacing: Style.space(1)
+
+                  Text {
+                    width: parent.width
+                    text: String(indexerRow.modelData.title)
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    color: indexerRow.ok ? root.foreground : Commons.Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Text {
+                    width: parent.width
+                    text: String(indexerRow.modelData.detail)
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                    color: indexerRow.ok ? root.dim : Commons.Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                text: Model.AGENT_CAPTION
+              }
+
+              Repeater {
+                model: root.agentRows
+
+                Column {
+                  id: agentRow
+                  required property var modelData
+                  width: settingsColumn.width
+                  spacing: Style.space(1)
+
+                  Button {
+                    focusable: true
+                    text: String(agentRow.modelData.label)
+                    bordered: true
+                    foreground: root.foreground
+                    accent: Commons.Color.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.svc.askAgent(String(agentRow.modelData.kind))
+                  }
+
+                  Text {
+                    width: parent.width
+                    text: String(agentRow.modelData.detail)
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    width: parent.width
+                    text: String(agentRow.modelData.note)
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    visible: text !== ""
+                  }
+                }
+              }
+
+              Item { width: 1; height: Style.spacing.sm }
+
+              Text {
+                width: parent.width
+                text: "Playback"
+                textFormat: Text.PlainText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.subtitle
+              }
+
+              Repeater {
+                model: root.sheetRows
+
+                Column {
+                  id: settingRow
+                  required property var modelData
+                  readonly property string rowKey: String(modelData.key || "")
+                  readonly property string rowSource: root.settingSource(rowKey)
+                  width: settingsColumn.width
+                  spacing: Style.space(2)
+
+                  // One control per schema type. `boolean` is a Toggle (stateless — it emits
+                  // clicked() and we flip the value ourselves); anything with `options` is a
+                  // ButtonGroup up to three choices and a Dropdown beyond that; a bare `integer` is
+                  // a NumberField bounded by the schema's own min/max/step; a bare `string` is a
+                  // text field.
+                  Loader {
+                    width: parent.width
+                    sourceComponent: {
+                      if (settingRow.modelData.type === "boolean") return toggleControl
+                      if (settingRow.modelData.type === "list") return listControl
+                      var opts = settingRow.modelData.options
+                      if (opts && opts.length > 0) return opts.length > 3 ? dropdownControl : groupControl
+                      if (settingRow.modelData.type === "integer") return numberControl
+                      return textControl
+                    }
+                    onLoaded: item.row = settingRow.modelData
+                  }
+
+                  // Where this value comes from, and a way back. Shown only when it is not the
+                  // default, so the sheet stays quiet until precedence actually matters.
+                  Row {
+                    spacing: Style.spacing.sm
+                    visible: settingRow.rowSource !== "default"
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: root.sourceCaption(settingRow.rowKey)
+                      textFormat: Text.PlainText
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Button {
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: settingRow.rowSource === "shell"
+                      text: "reset"
+                      tooltipText: "Drop this key from shell.json, back to config.json or the default"
+                      foreground: root.foreground
+                      accent: Commons.Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: root.resetSetting(settingRow.rowKey)
+                    }
+                  }
+                }
+              }
+
+              Item { width: 1; height: Style.spacing.md }
+
+              // The disclosure header: clickable, Enter-able, and it says how many of the keys
+              // behind it are not at their default so a changed one is never hidden silently.
+              Row {
+                id: advancedHead
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Button {
+                  id: advancedToggle
+                  anchors.verticalCenter: parent.verticalCenter
+                  focusable: true
+                  text: (root.advancedOpen ? "\u25be  " : "\u25b8  ") + "Advanced \u00b7 "
+                        + root.advancedRows.length + " settings"
+                  tooltipText: "Indexer and provider order, fansub groups, budgets. Same store, same precedence."
+                  foreground: root.foreground
+                  accent: Commons.Color.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  onClicked: root.advancedOpen = !root.advancedOpen
+                  Keys.onPressed: function (event) {
+                    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                        || event.key === Qt.Key_Space) {
+                      root.advancedOpen = !root.advancedOpen
+                      event.accepted = true
+                    }
+                  }
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: !root.advancedOpen && root.advancedChangedCount() > 0
+                  text: root.advancedChangedCount() + " changed"
+                  textFormat: Text.PlainText
+                  color: Commons.Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Button {
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: root.advancedOpen && root.advancedChangedCount() > 0
+                  text: "reset all"
+                  tooltipText: "Drop every advanced key from shell.json in one write"
+                  foreground: root.foreground
+                  accent: Commons.Color.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.resetAdvanced()
+                }
+              }
+
+              Text {
+                width: parent.width
+                visible: root.advancedOpen
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                text: "Saved to Omarchy's shell.json like every other setting. "
+                      + (root.service ? root.service.configPath : "config.json")
+                      + " is still the middle layer: a key set there wins over the default and loses "
+                      + "to anything saved here, and reset hands the key back to it."
+              }
+
+              Repeater {
+                model: root.advancedOpen ? root.advancedRows : []
+
+                Column {
+                  id: advancedRow
+                  required property var modelData
+                  readonly property string rowKey: String(modelData.key || "")
+                  readonly property string rowSource: root.settingSource(rowKey)
+                  width: settingsColumn.width
+                  spacing: Style.space(2)
+
+                  Loader {
+                    width: parent.width
+                    sourceComponent: {
+                      if (advancedRow.modelData.type === "boolean") return toggleControl
+                      if (advancedRow.modelData.type === "list") return listControl
+                      var opts = advancedRow.modelData.options
+                      if (opts && opts.length > 0) return opts.length > 3 ? dropdownControl : groupControl
+                      if (advancedRow.modelData.type === "integer") return numberControl
+                      return textControl
+                    }
+                    onLoaded: item.row = advancedRow.modelData
+                  }
+
+                  Row {
+                    spacing: Style.spacing.sm
+                    visible: advancedRow.rowSource !== "default"
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: root.sourceCaption(advancedRow.rowKey)
+                      textFormat: Text.PlainText
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Button {
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: advancedRow.rowSource === "shell"
+                      text: "reset"
+                      tooltipText: "Drop this key from shell.json, back to config.json or the default"
+                      foreground: root.foreground
+                      accent: Commons.Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: root.resetSetting(advancedRow.rowKey)
+                    }
+                  }
+                }
+              }
+
+              Item { width: 1; height: Style.spacing.md }
+            }
+          }
+        }
+
+        // --- the control shapes the schema maps onto ------------------------------------
+        Component {
+          id: listControl
+          Column {
+            id: listCol
+            property var row: ({})
+            width: parent ? parent.width : 0
+            spacing: Style.space(4)
+
+            Text {
+              text: String(listCol.row.label || listCol.row.key || "")
+              textFormat: Text.PlainText
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            OrderedList {
+              width: parent.width
+              values: root.settingValue(String(listCol.row.key || ""))
+              options: listCol.row.options ? listCol.row.options : []
+              foreground: root.foreground
+              dim: root.dim
+              fontFamily: root.fontFamily
+              readonly property var shape: Model.listRowShape(String(listCol.row.key || ""))
+              placeholder: shape.placeholder
+              addLabel: shape.addLabel
+              // Free-text rows check their entries per key (add-on names, group names);
+              // the fixed-option list needs no validator.
+              validator: (listCol.row.options && listCol.row.options.length > 0) ? null : shape.validator
+              // Stored comma-joined, because a JSON array does not survive the shell.json entry
+              // (measured; `core.as_list` is the Python half).
+              onChanged: function (values) {
+                root.writeSetting(String(listCol.row.key || ""), Model.joinList(values))
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: text !== ""
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              text: String(listCol.row.description || "")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
+        Component {
+          id: toggleControl
+          Toggle {
+            property var row: ({})
+            width: parent ? parent.width : 0
+            label: String(row.label || row.key || "")
+            description: String(row.description || "")
+            checked: root.logic.asBool(root.settingValue(String(row.key || "")), false)   // "true" too
+            foreground: root.foreground
+            accent: Commons.Color.accent
+            fontFamily: root.fontFamily
+            // Ui/Toggle is stateless: it reports the click and we decide the new value.
+            onClicked: root.writeSetting(String(row.key || ""), !checked)
+          }
+        }
+
+        Component {
+          id: groupControl
+          Column {
+            property var row: ({})
+            width: parent ? parent.width : 0
+            spacing: Style.space(2)
+
+            Text {
+              text: String(parent.row.label || parent.row.key || "")
+              textFormat: Text.PlainText
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            ButtonGroup {
+              options: parent.row.options || []
+              value: String(root.settingValue(String(parent.row.key || "")))
+              foreground: root.foreground
+              background: root.background
+              accent: Commons.Color.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              // ButtonGroup speaks strings; an integer schema key has to arrive at shell.json as a
+              // number or `core.as_int` would be coercing a string on every read
+              // (`omarchy bar set` without --json stores "1", and bool("false") is true).
+              onChanged: function (v) {
+                root.writeSetting(String(parent.row.key || ""),
+                                  parent.row.type === "integer" ? parseInt(v, 10) : String(v))
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: !!parent.row.description
+              text: String(parent.row.description || "")
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
+        Component {
+          id: dropdownControl
+          Column {
+            id: menuControl
+            property var row: ({})
+            width: parent ? parent.width : 0
+            spacing: Style.space(2)
+            onRowChanged: root.noteMenu(menuControl.row)
+
+            Connections {
+              target: root
+              function onSettingsOpenChanged() { if (root.settingsOpen) root.noteMenu(menuControl.row) }
+            }
+
+            Dropdown {
+              width: Math.min(Style.space(260), parent.width)
+              label: String(parent.row.label || parent.row.key || "")
+              options: root.optionChoices(parent.row)
+              value: String(root.settingValue(String(parent.row.key || "")))
+              foreground: root.foreground
+              accent: Commons.Color.accent
+              fontFamily: root.fontFamily
+              onChanged: function (v) {
+                root.writeSetting(String(parent.row.key || ""),
+                                  parent.row.type === "integer" ? parseInt(v, 10) : String(v))
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: !!parent.row.description
+              text: String(parent.row.description || "")
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
+        Component {
+          id: numberControl
+          Column {
+            id: numberCol
+            property var row: ({})
+            width: parent ? parent.width : 0
+            spacing: Style.space(2)
+
+            // One key's control unit is not its stored unit: the subtitle cache is shown in MiB,
+            // because 16777216 is not a number anybody wants to type. Its schema min/max are in
+            // bytes, so they are converted too rather than duplicated. `null` for every other key.
+            readonly property var unit: root.byteUnitOf(String(numberCol.row.key || ""))
+            readonly property real factor: numberCol.unit ? Number(numberCol.unit.factor) : 1
+
+            NumberField {
+              label: String(numberCol.row.label || numberCol.row.key || "")
+                     + (numberCol.unit ? " — " + String(numberCol.unit.label) : "")
+              from: numberCol.row.min === undefined ? 0
+                    : (numberCol.unit ? Model.bytesToUnit(numberCol.row.min, numberCol.factor)
+                                      : Number(numberCol.row.min))
+              to: numberCol.row.max === undefined ? 1000
+                  : (numberCol.unit ? Model.bytesToUnit(numberCol.row.max, numberCol.factor)
+                                    : Number(numberCol.row.max))
+              stepSize: numberCol.row.step === undefined ? 1 : Number(numberCol.row.step)
+              value: {
+                var v = Number(root.settingValue(String(numberCol.row.key || ""))) || 0
+                return numberCol.unit ? Model.bytesToUnit(v, numberCol.factor) : v
+              }
+              foreground: root.foreground
+              accent: Commons.Color.accent
+              fontFamily: root.fontFamily
+              onModified: function (v) {
+                root.writeSetting(String(numberCol.row.key || ""),
+                                  numberCol.unit ? Model.unitToBytes(v, numberCol.factor) : Number(v))
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: !!numberCol.row.description
+              text: String(numberCol.row.description || "")
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
+        Component {
+          id: textControl
+          Column {
+            property var row: ({})
+            width: parent ? parent.width : 0
+            spacing: Style.space(2)
+
+            Text {
+              text: String(parent.row.label || parent.row.key || "")
+              textFormat: Text.PlainText
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            TextField {
+              id: valueField
+              width: Math.min(Style.space(320), parent.width)
+              text: String(root.settingValue(String(parent.row.key || "")) || "")
+              // Empty is a setting, not a gap: the font follows the subtitle language.
+              placeholderText: parent.row.key === "subtitleFont" ? "Automatic: follows the subtitle language" : ""
+              foreground: root.foreground
+              accent: Commons.Color.accent
+              // Written on Enter or on focus loss, not on every keystroke: one shell.json write per
+              // typed character would rewrite the whole bar config thirty times for one font name.
+              // Trimmed, because a stray space is what a font-family lookup will not forgive and a
+              // Tab through the field is enough to produce one.
+              onAccepted: root.writeSetting(String(parent.row.key || ""), String(text).trim())
+              onActiveFocusChanged: if (!activeFocus)
+                                      root.writeSetting(String(parent.row.key || ""), String(text).trim())
+            }
+
+            Text {
+              width: parent.width
+              visible: !!parent.row.description
+              text: String(parent.row.description || "")
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
+        // The window's own status line (`Model.settingsStatus`): a play starting, a settings write that failed, the
+        // play's error, a refused play, the restart and standing notices, else the keys. The overlay that also says
+        // them is hidden while this window is up.
+        Text {
+          id: settingsStatus
+          anchors.bottom: parent.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          readonly property var line: Model.settingsStatus({
+            loaded: !!root.service,
+            busy: root.service ? root.service.busy : "",
+            playRefusal: root.service ? root.service.playRefusal : "",
+            settingsError: root.service ? root.service.settingsError : "",
+            lastError: root.service ? root.service.lastError : "",
+            errorHeadline: root.service && root.service.lastError ? root.svc.errorHeadline() : "",
+            errorDetail: root.service && root.service.lastError ? root.svc.errorDetail() : "",
+            restartNotice: root.bridge.notice,
+            notice: root.service ? root.service.notice : "",
+            back: !root.settingsAlone,
+          })
+          textFormat: Text.PlainText
+          wrapMode: Text.Wrap
+          maximumLineCount: 3
+          elide: Text.ElideRight
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          color: settingsStatus.line.alert ? Commons.Color.accent : root.dim
+          text: settingsStatus.line.text
         }
       }
     }

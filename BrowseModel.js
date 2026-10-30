@@ -1129,22 +1129,107 @@ function torznabBudgetText(block) {
   return n > 0 ? "up to " + Math.round(n) + " s" : "a few seconds"
 }
 
-// The offers for a Prowlarr or Jackett found running on this computer, from `torznab find-local` (`local`:
-// {found:[{product, address, hostport, words:{headline, action}}]}): one per server found, only while `listEmpty`
-// (ServiceLogic.js `torznabListEmpty`, the same rule the Service asks by). `address` pre-fills the add row; the key
-// is the user's to paste.
-function torznabOffers(listEmpty, local) {
-  if (listEmpty !== true || !local || typeof local !== "object") return []
+// The line under TorBox's device code, from the Service's `torboxCodeClip`: the code was put on the
+// clipboard, or that could not be done; "" before the copy has answered (and with a Service older than this file).
+function deviceClipText(clip) {
+  if (clip === "copied") return "Copied to the clipboard: paste it on that page."
+  if (clip === "failed") return "Could not copy it to the clipboard (wl-copy failed); type it on that page."
+  return ""
+}
+
+// The Settings window's status line: {text, alert}, in the order the sheet's line had on the overlay. A play
+// starting (`busy`, with a play refused meanwhile under it), then a settings write that failed (it outranks the play's
+// error), then the play's error (`errorHeadline` over `errorDetail`, while `lastError` is set), a play refused before
+// it started (`playRefusal`), the restart notice of a Service older than this file, a standing notice (token expiry,
+// AniList budget), else the keys. `alert` as the overlay colours it: an error or a notice is up. `back`: Escape goes
+// back to the overlay rather than closing.
+function settingsStatus(o) {
+  var s = o && typeof o === "object" ? o : {}
+  if (!s.loaded) return { text: "Service not loaded", alert: false }
+  var alert = !!(s.lastError || s.notice || s.restartNotice || s.settingsError)
+  var text
+  if (s.busy) text = String(s.busy) + (s.playRefusal ? "\n" + String(s.playRefusal) : "")
+  else if (s.settingsError) text = String(s.settingsError)
+  else if (s.lastError) text = String(s.errorHeadline || "") + "\n" + String(s.errorDetail || "")
+  else if (s.playRefusal) text = String(s.playRefusal)
+  else if (s.restartNotice) text = String(s.restartNotice)
+  else if (s.notice) text = String(s.notice)
+  else text = "Tab moves between settings · j/k scrolls · every change is saved to shell.json · reset gives a key "
+              + "back to config.json · Escape " + (s.back ? "goes back" : "closes")
+  return { text: text, alert: alert }
+}
+
+// One server's address as "host:port", for "is this found server already listed?", or "" when it is no
+// http(s) address. Only the authority counts: a path (a Prowlarr indexer's `/1/api`, Jackett's
+// `/api/v2.0/indexers/all/results/torznab`), a query and a trailing `/` do not make another server; user info (the
+// listing's `<redacted>@`) is dropped; the port defaults by scheme; every name for this computer (`localhost`,
+// `*.localhost`, 127.0.0.0/8, `::1`) reads as one. A regex rather than `URL`, which throws on a bad address.
+function torznabHostPort(url) {
+  var m = /^\s*(https?):\/\/([^\/?#]*)/i.exec(String(url || ""))
+  if (!m) return ""
+  var auth = m[2]
+  var at = auth.lastIndexOf("@")
+  if (at >= 0) auth = auth.slice(at + 1)
+  var host = auth
+  var port = ""
+  if (auth.charAt(0) === "[") {
+    var end = auth.indexOf("]")
+    if (end < 0) return ""
+    host = auth.slice(1, end)
+    var rest = auth.slice(end + 1)
+    if (rest !== "" && rest.charAt(0) !== ":") return ""
+    port = rest.slice(1)
+  } else {
+    var colon = auth.lastIndexOf(":")
+    if (colon >= 0) {
+      host = auth.slice(0, colon)
+      port = auth.slice(colon + 1)
+    }
+  }
+  host = host.toLowerCase().replace(/\.$/, "")
+  if (host === "") return ""
+  if (port === "") port = m[1].toLowerCase() === "https" ? "443" : "80"
+  if (!/^[0-9]{1,5}$/.test(port)) return ""
+  if (host === "localhost" || /\.localhost$/.test(host) || host === "::1" || host === "0:0:0:0:0:0:0:1"
+      || /^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/.test(host)) host = "this-computer"
+  return host + ":" + parseInt(port, 10)
+}
+
+// What the sheet does with `torznab find-local`'s answer (`local`: {found:[{product, address, hostport,
+// words:{headline, action}}]}) against the listed servers (`block`, the `accounts` answer's `torznab`): `offers` one
+// per server found and not already listed (`torznabHostPort`), `found`/`listed` the products found and those of them
+// already listed, for the log. Nothing is offered unless `usable` (ServiceLogic.js `torznabListUsable`, the rule the
+// Service asks by). `address` pre-fills the add row; the key is the user's to paste.
+function torznabOfferDecision(usable, block, local) {
+  var out = { offers: [], found: [], listed: [] }
+  if (!local || typeof local !== "object") return out
   var found = isList(local.found) ? local.found : []
-  var out = []
+  var servers = block && typeof block === "object" && isList(block.servers) ? block.servers : []
+  var taken = {}
+  for (var j = 0; j < servers.length; j++) {
+    var hp = servers[j] && typeof servers[j] === "object" ? torznabHostPort(servers[j].url) : ""
+    if (hp) taken[hp] = true
+  }
   for (var i = 0; i < found.length; i++) {
     var f = found[i]
     if (!f || typeof f !== "object" || !f.address) continue
+    var product = String(f.product || "")
+    out.found.push(product)
+    if (taken[torznabHostPort(f.address)]) {
+      out.listed.push(product)
+      continue
+    }
+    if (usable !== true) continue
     var w = f.words && typeof f.words === "object" ? f.words : {}
-    out.push({ product: String(f.product || ""), address: String(f.address),
-               text: String(w.headline || ""), where: String(w.action || "") })
+    out.offers.push({ product: product, address: String(f.address),
+                      text: String(w.headline || ""), where: String(w.action || "") })
   }
   return out
+}
+
+// The offers alone (`torznabOfferDecision`), for the sheet's rows.
+function torznabOffers(usable, block, local) {
+  return torznabOfferDecision(usable, block, local).offers
 }
 
 // The Service and ServiceLogic.js Browse.qml talks to can be older than Browse.qml. A plugin update
@@ -1190,7 +1275,8 @@ var SERVICE_PROPERTIES = [
   "playRefusal", "settings",
   "settingsError",
   "settingsSource",
-  "torboxDevice", "torznabAnswer", "torznabBusy", "torznabChecks", "torznabLocal", "watching", "watchingFailure",
+  "torboxCodeClip", "torboxDevice", "torznabAnswer", "torznabBusy", "torznabChecks", "torznabLocal", "watching",
+  "watchingFailure",
   "watchingLoaded", "watchingSaved",
 ]
 
@@ -1232,7 +1318,7 @@ var LOGIC_FUNCTIONS = {
   listStateText: function (o) {
     return { state: "loading", text: "Loading " + String((o && o.what) || "your list") + "…" }
   },
-  torznabListEmpty: false,         // "not empty", so no offer is shown
+  torznabListUsable: false,        // "not usable", so no offer is shown
 }
 
 var SERVICE_RESTART = "omarchy restart shell"

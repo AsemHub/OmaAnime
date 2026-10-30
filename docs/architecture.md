@@ -45,7 +45,7 @@ Omarchy shell (Quickshell)                      Python CLI (standard library onl
 | `addon_check.py` | `addons check`: one add-on file loaded as the registry would and asked once, offline (every request answered with `ctx.HttpError`, a connection of its own through the usual socket calls refused: a check, not a sandbox) or `--live` |
 | `torznab.py` | the built-in Torznab add-on: a server's feeds, caps, the query plan, safe XML, servers and feeds side by side (round-robin) within the add-on's time, and the Accounts `check` |
 | `torznab_prowlarr.py` | Prowlarr detection and expansion: what a server is (status endpoint, then caps), remembered per server; a Prowlarr's indexer list filtered to its enabled torrent anime/movie indexers, each searched with the key in `X-Api-Key` |
-| `torznab_accounts.py` | the Accounts sheet's Torznab servers: `torznab` list, add, check and remove; an add checked before it is saved, every write read back at mode 600, a removal takes what the add-on remembered about the server |
+| `torznab_accounts.py` | the Torznab servers under Settings' Accounts: `torznab` list, add, check and remove; an add checked before it is saved, every write read back at mode 600, a removal takes what the add-on remembered about the server |
 | `torznab_servers.py` | the Torznab servers file (API keys, mode 600): its one reader and writer, and the keys the log scrubber masks |
 | `score.py` | title parsing, filters and the ranking |
 | `providers.py` | TorBox and Real-Debrid, and the guard that steps over a provider refusing the account |

@@ -22,11 +22,9 @@ You also need **Omarchy 4.0.3 or later**. Everything else the plugin uses comes 
 
 ### Get TorBox for about $1.70 a month
 
-1. Sign up through a referral link, a friend's or mine:
-
-   > <https://torbox.app/subscription?referral=a4ccbf06-f664-4238-99d7-1a457793644b>
-
-   A referral link gives you 84 free days on a year.
+1. Sign up through a referral link, a friend's or
+   [mine](https://torbox.app/subscription?referral=a4ccbf06-f664-4238-99d7-1a457793644b). A referral link gives you
+   84 free days on a year.
 2. Choose **One-Time**, then **1 Year**, then **Essential** ($36). Essential is all you need, and a year gives you the
    most for your money.
 3. Enter the code **`SIGMA30`** and pay with **crypto**. The price drops to $25.20.

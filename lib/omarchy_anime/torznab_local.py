@@ -1,8 +1,9 @@
-"""A Prowlarr or Jackett running on this computer, for the Accounts sheet's offer.
+"""A Prowlarr or Jackett running on this computer, for the offer in Settings' Accounts.
 
-When the sheet's Torznab list is empty it runs `torznab find-local`, which asks each product's default port on
-loopback one anonymous question and offers the address it answered on. The user still pastes the key, and the
-normal add + check path (`torznab_accounts.add`) does everything else; nothing is saved here.
+Each time Accounts opens (with a Torznab list it can add to) it runs `torznab find-local`, which asks each product's
+default port on loopback one anonymous question; Settings offers each address that answered and is not listed yet.
+The user still pastes the key, and the normal add + check path (`torznab_accounts.add`) does everything else; nothing
+is saved here.
 
 What is asked, and why it is safe (verified 2026-09-30, read-only and from source):
 - Prowlarr: `GET /ping` on 9696 answers 200 `{"status":"OK"}` without a key (`PingController`, `[AllowAnonymous]`).

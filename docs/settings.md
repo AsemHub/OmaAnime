@@ -9,10 +9,10 @@ the README's [Install](../README.md#install).
 
 ## Where a setting is changed
 
-**The settings sheet.** Click **Settings** in the Anime bar popout, or run
+**The Settings window.** Click **Settings** in the Anime bar popout, or run
 `omarchy-shell omaanime browse settings` (inside the Browse overlay, `,` opens it too). Omarchy 4.0.3 has no settings screen for a bar widget, so
 the plugin brings its own. Every change is saved as you make it. The keys marked *advanced* below sit
-behind the sheet's **Advanced** disclosure (`omarchy-shell omaanime browse advanced` opens the sheet
+behind the window's **Advanced** disclosure (`omarchy-shell omaanime browse advanced` opens the window
 with it expanded).
 
 **From a terminal:**
@@ -39,10 +39,10 @@ Three layers, each one beating the one above it:
 2. `~/.config/omaanime/config.json` (`$XDG_CONFIG_HOME/omaanime/config.json`), if you create it. Every
    key can live here; it is the file to copy between machines. The plugin never writes it. A file that
    is not valid JSON stops every command with a message naming the file;
-3. the plugin's entry in `~/.config/omarchy/shell.json`: what the sheet, `setSetting` and `omarchy bar
+3. the plugin's entry in `~/.config/omarchy/shell.json`: what Settings, `setSetting` and `omarchy bar
    set` write.
 
-The sheet says under each setting which layer it is reading, and **reset** removes the key from
+Settings says under each setting which layer it is reading, and **reset** removes the key from
 `shell.json` so the layer below applies again.
 
 A list is stored in `shell.json` comma-joined (`torbox,realdebrid`), not as a JSON array, because
@@ -50,7 +50,7 @@ Omarchy's own writer flattens a top-level array to exactly that. `config.json` t
 
 A number outside its range, from a hand-edited file or `omarchy bar set`, is replaced by the default
 and logged as a warning (`omarchy-anime trace`); it never fails a play. The ranges below are the ones
-the plugin enforces; the sheet's own controls may offer a narrower choice.
+the plugin enforces; Settings' own controls may offer a narrower choice.
 
 ## Playback and subtitles
 
@@ -60,7 +60,7 @@ Default: `"eng"`
 
 Your subtitle language, as an ISO 639-2 code. A release that carries this language ranks higher; when the
 release that plays lacks it, the plugin can borrow it (see `sideloadSubtitles`) or fetch it from Subdl and
-OpenSubtitles. The sheet offers the 38 languages that release track lists carry and the subtitle databases
+OpenSubtitles. Settings offers the 38 languages that release track lists carry and the subtitle databases
 offer: Arabic `ara`, Basque `baq`, Bosnian `bos`, Catalan `cat`, Chinese `chi`, Croatian `hrv`, Czech `cze`,
 Danish `dan`, Dutch `dut`, English `eng`, Filipino `fil`, Finnish `fin`, French `fre`, Galician `glg`, German
 `ger`, Greek `gre`, Hebrew `heb`, Hindi `hin`, Hungarian `hun`, Indonesian `ind`, Italian `ita`, Japanese
@@ -141,7 +141,7 @@ Default: `1080`
 
 Range: `240` to `4320`
 
-The picture height the ranking rewards. Other heights still play. The sheet offers 720, 1080 and 2160.
+The picture height the ranking rewards. Other heights still play. Settings offers 720, 1080 and 2160.
 
 ### `subtitleFont`
 
@@ -413,7 +413,7 @@ Default: `16777216`
 
 Range: `1048576` to `536870912`
 
-The size limit of the borrowed-subtitle cache, in bytes (the sheet shows and steps it in MiB).
+The size limit of the borrowed-subtitle cache, in bytes (Settings shows and steps it in MiB).
 `omarchy-anime subs prune` enforces it (`--max-bytes` sets another limit for one run), and the plugin
 prunes to it once a day, after a play.
 

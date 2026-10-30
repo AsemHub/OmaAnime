@@ -49,12 +49,15 @@ and the player need none of this. Then:
    Prowlarr or Jackett in Accounts, or add an indexer add-on." and says where add-on files go.
    Settings lists what loaded.
 
-**From the settings sheet** (**Settings** in the Anime bar popout, or
-`omarchy-shell omaanime browse accounts`) — **Accounts** is the first section.
+**From the Settings window** (**Settings** in the Anime bar popout, or
+`omarchy-shell omaanime browse accounts`) — **Accounts** is the first section. Settings is a normal window: drag it
+by its title, put it beside your browser and Alt-Tab between the two, so nothing has to be closed while you copy a
+code, a token or a key from one to the other. `Escape` or **✕** closes it.
 
 **TorBox: sign in with a code (the default).** *Sign in* on the TorBox row shows a 6-digit code, a
 short address and a QR code. Open the address (or scan the code with your phone), sign in to TorBox
-if you are not already, enter the code and approve. The sheet picks the key up by itself within
+if you are not already, enter the code and approve. The code is already on your clipboard (the row says "Copied to
+the clipboard"), so paste it. Settings picks the key up by itself within
 about 15 seconds of the approval and shows the account. The code is good for 10 minutes; if it runs out,
 or the approval is declined, the row says so and **Get a new code** starts again. TorBox's approval
 page may name the app "Third Party App" rather than this plugin. **Paste a token instead** is on the
@@ -71,12 +74,17 @@ it (`http://host:9696`, with its URL base if it has one) and its API key, which 
 paste the Torznab feed address of `all` (or of a filter such as `tag:anime`) and Jackett's API key,
 shown at the top right of its dashboard. Any other Torznab feed works the same way.
 
-**Add and check** asks the server what it is before saving (up to 20 seconds; the sheet stays usable
+**Found on this computer.** Each time Accounts opens, the plugin asks this computer's Prowlarr (port 9696) and
+Jackett (port 9117) ports, without a key, and offers each one that answers and is not added yet: **Add Prowlarr**
+or **Add Jackett** opens the add row with the address filled in, and you paste the key. Adding one leaves the other
+offered; a server counts as added by its host and port (`localhost` and `127.0.0.1` are the same).
+
+**Add and check** asks the server what it is before saving (up to 20 seconds; Settings stays usable
 meanwhile) and says what it found: "Saved: Prowlarr with 12 indexers." or "Saved: a Torznab feed.". When
 something is wrong it says what, and the server is not saved: a wrong API key, the server asks for a login
 (a proxy in front of it), not a Torznab or Prowlarr address, no anime category, or a Prowlarr with no
 indexer for anime or movies. When a new server only did not answer (no answer, no answer in time, a pause
-it asked for, an error on its side), it is saved anyway and the sheet says to check it again in a moment,
+it asked for, an error on its side), it is saved anyway and Settings says to check it again in a moment,
 or, for a Prowlarr whose indexers it paused or could not search, where Prowlarr says why.
 Adding an address that is already there replaces its key, but only when the check passes; a key that
 fails leaves the old one, and what the plugin knew about the server, as they were.
@@ -84,10 +92,10 @@ fails leaves the old one, and what the plugin knew about the server, as they wer
 Each server's row shows what it is and the key's last four characters (none of it when the key is under
 16 characters). **Check** asks it again and names each Prowlarr indexer that cannot be searched now. One that
 Prowlarr itself could not search (its site did not answer Prowlarr, say) reads "Prowlarr could not search it",
-and the sheet says that Prowlarr's own log says why (*System > Events* in Prowlarr).
+and Settings says that Prowlarr's own log says why (*System > Events* in Prowlarr).
 **Remove** (click twice) deletes it and everything the plugin remembered about it. A row whose address the
 plugin cannot use (a user name, a key or a query in it, or the same feed twice) says why, and can still be
-checked and removed. The sheet names a row by an id, so no address is ever on a command line.
+checked and removed. Settings names a row by an id, so no address is ever on a command line.
 
 **Or from a terminal**, if you prefer:
 
@@ -117,7 +125,7 @@ in `/proc/<pid>/cmdline`, so the plugin refuses that form outright.
 
 | Provider | Where the token comes from |
 |---|---|
-| AniList | the URL `auth anilist` prints (or *Sign in* in the sheet) — approve, and copy what the page gives you |
+| AniList | the URL `auth anilist` prints (or *Sign in* in Settings) — approve, and copy what the page gives you |
 | TorBox | nowhere: *Sign in* (or `auth torbox --device`) gets it for you; to paste one, <https://torbox.app/settings> |
 | Real-Debrid | <https://real-debrid.com/apitoken> |
 | Subdl (optional, external subtitles) | <https://subdl.com/panel/api> |

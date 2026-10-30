@@ -59,7 +59,7 @@ HOUSEKEEPING: dict[str, frozenset | None] = {
     # The next episode's download at TorBox, which the tick starts by itself (`prefetch`).
     "prefetch": None,
     "pin": frozenset({"show"}), "groupstats": frozenset({"report"}), "subs": frozenset({"status", "prune"}),
-    # find-local runs by itself when Accounts opens with no server.
+    # find-local runs by itself each time Accounts opens.
     "torznab": frozenset({"list", "find-local"}),
     # The bar's window and transport buttons; `start` and `restart` park a player and stay.
     "player": frozenset({"status", "show", "hide", "toggle", "pause", "stop", "sub-delay"}),

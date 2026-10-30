@@ -874,6 +874,20 @@ function deviceStartDecision(o) {
   return "busy"
 }
 
+// Whether the device code a sign-in now shows goes on the clipboard: once per run (`trace`, the Service's
+// device run, against `copiedTrace`, the run it last copied for), while it waits, and only a code that looks like one
+// (TorBox's is 6 characters). The viewer pastes it at TorBox instead of typing it from the window.
+function deviceCopyWanted(sign, trace, copiedTrace) {
+  if (!sign || sign.state !== "waiting" || !trace || String(trace) === String(copiedTrace || "")) return false
+  return /^[A-Za-z0-9]{4,12}$/.test(String(sign.code || ""))
+}
+
+// What the TorBox row says of the copy, from `wl-copy`'s exit status: "copied" only for 0, so a failed copy never
+// tells the viewer to paste whatever the clipboard held before.
+function deviceClipResult(code) {
+  return code === 0 ? "copied" : "failed"
+}
+
 // The stdout result: `{saved: true, ...}` or `{ok: false, error, suggest, deviceState}`. It
 // decides the end state even when the stderr line for it was lost, and adds the error text. A
 // cancelled run stays cancelled, unless it saved a token before it stopped: the disk wins, so the
@@ -921,15 +935,15 @@ function deviceStatusText(sign) {
   }
 }
 
-// A Torznab list (the `accounts` answer's `torznab` block) the sheet may offer to fill. Empty, and usable: a
-// refused file, or one with an entry it could not read, shows no row either, but `torznab add` would refuse to write
-// it, so nothing is offered there. Service.qml asks `torznab find-local` only when this holds, and Browse.qml shows
-// the offers (BrowseModel.js `torznabOffers`) only when it holds.
-function torznabListEmpty(block) {
+// A Torznab list (the `accounts` answer's `torznab` block) the sheet may offer to add to: usable, empty or not. A
+// refused file, or one with an entry it could not read, may show no row either, but `torznab add` would refuse to
+// write it, so nothing is offered there. Service.qml asks `torznab find-local` on an open of Accounts only when this
+// holds, and Browse.qml shows the offers not already listed (BrowseModel.js `torznabOffers`) only when it holds.
+function torznabListUsable(block) {
   if (!block || typeof block !== "object" || isList(block)) return false
   if (block.problem) return false
   if (isList(block.skipped) && block.skipped.length > 0) return false
-  return isList(block.servers) && block.servers.length === 0
+  return isList(block.servers)
 }
 
 // Whether `value` is a list. On Qt 6.12 an array that crossed a QML boundary reaches JS as a sequence

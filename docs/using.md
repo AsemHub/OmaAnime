@@ -20,19 +20,19 @@ the README's [Install](../README.md#install).
 ### Browse overlay
 
 Five views — Continue Watching, Top 100, Airing, Search, Lists — plus a per-anime detail page with
-an episode grid and a settings sheet. It is keyboard-first; every key below also has a pointer route.
+an episode grid. Settings opens in its own window (below). It is keyboard-first; every key below also has a pointer
+route.
 
 | Mouse | Does |
 |---|---|
 | Click a row | The same as `Enter` |
 | Right-click a row, or its `⋯` | Open that show's episodes — the same as `e` |
 | Hover a row or a cell | Moves the cursor, so `j` continues from where you are pointing. One highlight, never two |
-| `↻` / `⚙` in the header | Reload the view (`r`) / open the settings sheet (`,`) |
+| `↻` / `⚙` in the header | Reload the view (`r`) / open Settings (`,`) |
 | "completed hidden (c)" on Top 100 | Show or hide completed entries (`c`) |
 | "Copy trace" in the status line | Copy the failed play's trace id (`t`). It only appears after a failure |
-| `✕` in the settings sheet, or a click on the dimmed background while it is open | Back to the list |
-| A click on the dimmed background otherwise | Close the overlay |
-| Wheel | Scrolls the list, the grid and the settings sheet. A scrollbar appears when there is more |
+| A click on the dimmed background | Close the overlay (in the release picker: back) |
+| Wheel | Scrolls the list, the grid and Settings. A scrollbar appears when there is more |
 
 | Key | Does |
 |---|---|
@@ -41,14 +41,14 @@ an episode grid and a settings sheet. It is keyboard-first; every key below also
 | `Enter` | Continue Watching: play (or open the episodes when there is nothing to play, as for an entry that is not out yet). Lists: depends on the list (see below). Other views: open the episodes |
 | `e` | Open the episodes of the selected show |
 | `[` `]` | Lists: switch between Planning, Paused, Completed, Dropped and Rewatching |
-| `,` | Open the settings sheet |
+| `,` | Open Settings; the overlay hides until it closes |
 | `/` | Jump to Search and start typing (`Escape` there returns to the list) |
 | `c` | Top 100: show or hide the shows you have completed |
 | `r` | Reload the current view from AniList, ignoring the cache |
 | `w` | Detail: add the show to your list as Watching, keeping its progress |
 | `p` | Detail: choose the release for the selected episode. After a refused play: choose one for it |
 | `t` | Copy the trace id of the last failed play to the clipboard |
-| `Escape` | Detail or settings: back. List: close the overlay |
+| `Escape` | Detail: back. List: close the overlay |
 
 **Lists** shows the five AniList lists that are not Continue Watching. What `Enter` does depends on
 which one you are looking at:
@@ -155,10 +155,15 @@ omarchy-anime player sub-delay --reset
 
 ## Settings in short
 
-**Open the settings sheet**: click **Settings** in the Anime bar popout, or run
+**Open Settings**: click **Settings** in the Anime bar popout, or run
 `omarchy-shell omaanime browse settings` (inside the Browse overlay, `,` opens it too). There is no per-widget settings screen in Omarchy 4.0.3
 — no gear, no right-click menu, no `omarchy-menu` entry — so the plugin brings its own. Every change
-is saved as you make it. **Accounts** and **Indexers** are sections of the same sheet.
+is saved as you make it. **Accounts** and **Indexers** are sections of the same window.
+
+Settings is a normal window, not part of the full-screen overlay: drag it by its title, Alt-Tab to it, and keep it
+beside your browser while you sign in. `Escape` or **✕** closes it; opened from the overlay, the overlay comes back.
+Asked for again while it is open (the popout's button, the command), it is shown again with what you typed kept.
+`Tab` walks its controls, `j` `k` and `PageUp` `PageDown` scroll.
 
 The same keys, from a terminal:
 
@@ -173,13 +178,13 @@ omarchy bar set io.github.asemhub.omaanime watchedThreshold 90 --json
 ```
 
 `omarchy bar set` **without `--json` stores the value as a string** (`"90"`, `"true"`) — the plugin
-copes, but pass `--json` and you will not have to think about it. The sheet always writes real
+copes, but pass `--json` and you will not have to think about it. Settings always writes real
 typed JSON.
 
 Three layers, each beating the one above it: the plugin's defaults; `~/.config/omaanime/config.json`,
 if you create it (every key can live there; it is the copy to carry between machines); and the
-plugin's entry in `~/.config/omarchy/shell.json`, which the sheet, `setSetting` and `omarchy bar set`
-write. The sheet says under each setting which layer it is reading, and its **reset** removes the key
+plugin's entry in `~/.config/omarchy/shell.json`, which Settings, `setSetting` and `omarchy bar set`
+write. Settings says under each setting which layer it is reading, and its **reset** removes the key
 from `shell.json`. A value outside a setting's range falls back to the default with a warning in
 `omarchy-anime trace`, never a failed play.
 
@@ -205,7 +210,7 @@ Every setting, with its default, its range and what it changes, is in
 | `pollIntervalSec` | 5 | how often the bar asks mpv for the position |
 | `showCompletedInTop` | false | show shows you have completed in the Top 100 view |
 
-Behind **▸ Advanced** at the bottom of the sheet (`omarchy-shell omaanime browse advanced` opens it
+Behind **▸ Advanced** at the bottom of Settings (`omarchy-shell omaanime browse advanced` opens it
 expanded), with the same per-key **reset** and a **reset all**:
 
 | key | default | what it is |
@@ -223,7 +228,7 @@ expanded), with the same per-key **reset** and a **reset all**:
 | `torboxWaitSeconds` | 60 | when a play waited for the one download it starts at TorBox: a wait up to this long, from starting the play until TorBox has it, plays by itself; a longer one loads paused and you are notified with a sound (not with Omarchy's do-not-disturb on); showing or hiding the player makes no difference; 0 always loads it paused. It does not end the wait: that runs until TorBox is done, you choose, or three hours |
 | `torrentInfoSeconds` | 5 | how long TorBox may look up a pack's files when no add-on lists them; 0 turns it off |
 | `httpTimeout` | 15 | seconds before an HTTP request gives up |
-| `subsCacheMaxBytes` | 16777216 | size limit of the borrowed-subtitle cache (the sheet shows MiB) |
+| `subsCacheMaxBytes` | 16777216 | size limit of the borrowed-subtitle cache (Settings shows MiB) |
 | `anilistClientId` | 51175 | only if you use your own AniList app |
 
 **Stream providers** is two fixed rows you turn on and off and move with ▲ ▼. **Indexers** and the
