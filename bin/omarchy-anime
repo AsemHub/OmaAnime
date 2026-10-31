@@ -6,9 +6,19 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 
 if __name__ == "__main__":
+    # First: the words a launch keeps off its command line (`OMAANIME_ARGS`, docs/privacy.md) join the argv, and the
+    # variable leaves this process's environment before anything can start a child.
+    from omarchy_anime import private_args  # noqa: E402
+    try:
+        argv = private_args.take(sys.argv[1:])
+    except private_args.Refused as exc:
+        sys.exit(private_args.refuse(sys.argv[1:], exc))
+    # How many of the words came in the variable, for the `cli start` line: a launcher that puts them back on its
+    # command line shows there as `fromEnv=0`.
+    from_env = len(argv) - len(sys.argv[1:])
     # The bar runs `status` every ten seconds; it imports only what it reads, not the whole CLI.
     from omarchy_anime import status  # noqa: E402
-    if status.lean_trace(sys.argv[1:]) is not None:
-        sys.exit(status.main(sys.argv[1:]))
+    if status.lean_trace(argv) is not None:
+        sys.exit(status.main(argv, from_env=from_env))
     from omarchy_anime.cli import main  # noqa: E402
-    sys.exit(main())
+    sys.exit(main(argv, from_env=from_env))

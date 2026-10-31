@@ -219,9 +219,9 @@ class Watcher:
                 removed = pending.remove(media, ep, self.log, "the notification could not be sent", torrent_id=tid)
                 self.log.warn("watch", "tell", result="FAIL", mediaId=media, episode=ep, torrentId=tid, why=why,
                               body=body, gave_up=True, removed=removed, fails=st["tell_fails"], past_day=old,
-                              suggest="no notification could be sent for this request, so it is dropped: check the "
-                                      "notification server (`omarchy-notification-send` on Omarchy, else "
-                                      "`notify-send`) and the `notify send` lines' error")
+                              suggest="no notification could be sent for this request, so it is dropped: the "
+                                      "`notify send` lines' failed_at, error and suggest say why (the session bus, or "
+                                      "the notification server: Omarchy's shell)")
                 return False
             unmarked = pending.unmark(media, ep, tid, self.log, "notified", "notified_why")
             self.log.warn("watch", "tell", result="FAIL", mediaId=media, episode=ep, torrentId=tid, why=why,

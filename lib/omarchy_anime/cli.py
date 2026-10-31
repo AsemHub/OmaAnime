@@ -57,6 +57,7 @@ from . import trace as tracemod
 from . import player as playermod
 from . import playstate
 from . import prefetch as prefetchmod
+from . import private_args
 from . import covers
 from . import thumbs as thumbsmod
 from . import extsubs
@@ -74,6 +75,9 @@ from . import addon_check, addon_help
 # The `status` command's code lives where `bin/omarchy-anime` can reach it without importing this module.
 from .status import (ADVANCED_SETTINGS, SHEET_SETTINGS, emit_json, fail_internal, fail_stage, player_state,
                      report_setting_notes)
+
+# `player resume`'s detached play, by name so a test spawns nothing real.
+_spawn_detached = subprocess.Popen
 
 # ----------------------------------------------------------------------------- pipeline
 
@@ -5346,16 +5350,16 @@ def spawn_external_worker(log: Log, settings: dict, args, result: dict, ranked: 
             refs.append(ref)
     release = (chosen.get("file") or {}).get("basename") or chosen.get("title") or ""
     # Each value glued to its option: a file named `-Show.S01E04.mkv` given as its own word is read as an
-    # option, and the worker exits 2 before anything runs.
-    argv = [sys.executable, str(Path(__file__).resolve().parents[2] / "bin" / "omarchy-anime"), "--trace", log.trace,
-            "subs", "external", str(args.anilist_id), str(args.episode), "--load",
-            f"--info-hash={chosen.get('info_hash') or ''}", f"--sid={sid}", f"--release={release}",
-            f"--reference-releases={json.dumps(refs)}"]
-    argv += ["--nothing-on"] if nothing_on else []
-    argv += ["--donor-unverified"] if donor_unverified else []
+    # option, and the worker exits 2 before anything runs. Every word after the subcommand goes in `OMAANIME_ARGS`
+    # (`private_args`): the show, the release and its file name are not for the command line.
+    words = [str(args.anilist_id), str(args.episode), "--load", f"--info-hash={chosen.get('info_hash') or ''}",
+             f"--sid={sid}", f"--release={release}", f"--reference-releases={json.dumps(refs)}"]
+    words += ["--nothing-on"] if nothing_on else []
+    words += ["--donor-unverified"] if donor_unverified else []
+    argv, env = private_args.command(["--trace", log.trace, "subs", "external"], words)
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, start_new_session=True)
+                                stderr=subprocess.DEVNULL, start_new_session=True, env=env)
     except OSError as exc:
         log.warn("extsubs.worker", "spawn", result="FAIL", error=str(exc))
         return None
@@ -6192,10 +6196,16 @@ def player_resume(args, log: Log, mpv: Mpv, running: bool) -> dict:
         return {"paused": paused, "window": window, "played": None}
     if media is None:
         raise StageError("player", "mpv is not running", "omarchy-anime player start")
-    argv = [sys.executable, str(notifymod.BIN), "--trace", log.trace, "play", str(media), str(episode), "--show"]
-    pid = notifymod._detached(argv)
+    argv, env = private_args.command(["--trace", log.trace, "play"], [str(media), str(episode), "--show"])
+    try:
+        pid = _spawn_detached(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True, close_fds=True, env=env).pid
+    except OSError as exc:
+        log.warn("player.resume", "spawn", result="FAIL", error=str(exc))
+        pid = None
     log.emit("info" if pid else "warn", "player.resume", "play", result="PASS" if pid else "FAIL", pid=pid,
-             argv=argv[3:], suggest="" if pid else "the play could not be started; play the episode from Browse")
+             argv=[*argv[3:], *json.loads(env[private_args.ENV])],
+             suggest="" if pid else "the play could not be started; play the episode from Browse")
     return {"paused": None, "window": None, "played": {"pid": pid, "mediaId": media, "episode": episode}}
 
 
@@ -6504,7 +6514,7 @@ def prefetch_next(log: Log, args, now_playing: dict, pos: float, settings: dict)
     seen = prefetchmod.entry(args.anilist_id, nxt)
     if seen is not None:
         return {"episode": nxt, "reason": f"episode {nxt} was already prefetched ({seen.get('state')})"}
-    trace = prefetchmod.new_trace(args.anilist_id, nxt)
+    trace = prefetchmod.new_trace()
     taken = prefetchmod.latch(args.anilist_id, nxt, {"from": args.episode, "trace": trace, "playTrace": log.trace},
                               log)
     if taken is not None:
@@ -6676,7 +6686,9 @@ def stdin_only(value: str) -> str:
     return value
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, from_env: int = 0) -> int:
+    """The CLI. `from_env`: how many of `argv`'s words came in `OMAANIME_ARGS` (`private_args.take`), for the
+    `cli start` line."""
     ap = argparse.ArgumentParser(prog="omarchy-anime", description=CLI_DESCRIPTION,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--trace", help="trace id for log correlation")
@@ -6716,8 +6728,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="the episode playing when the tick started it (for the log)")
     sub.add_parser("watch", help="follow the downloads the viewer asked to be told about (\"Tell me when it's ready\") "
                                  "and notify when each is ready; one at a time, it exits when nothing is pending")
-    p = sub.add_parser("notify-wait", help=argparse.SUPPRESS)        # a notification's detached child (`notify.send`)
-    p.add_argument("spec")
+    p = sub.add_parser("notify-click", help=argparse.SUPPRESS)       # a notification's click (`notify.clicked`)
+    p.add_argument("token")
     p = sub.add_parser("later", help="\"Tell me when it's ready\": end the play of this episode that waits for (or "
                                      "held) TorBox's download, and record the download as pending")
     p.add_argument("anilist_id", type=int)
@@ -6939,10 +6951,19 @@ def main(argv: list[str] | None = None) -> int:
     # The trace command adds no `cli start`/`end` to the log it renders; `trace last` writes one `trace/last` line.
     observer = args.cmd == "trace"
     if not observer:
-        log.info("cli", "start", cmd=args.cmd, argv=safe_argv(argv or sys.argv[1:]), version=VERSION)
+        log.info("cli", "start", cmd=args.cmd, argv=safe_argv(argv or sys.argv[1:]), fromEnv=from_env,
+                 version=VERSION)
     try:
         settings = load_settings()
         report_setting_notes(log, CONFIG_DIR)
+        if args.cmd == "notify-click":
+            # The click's action, named by its token, runs here under the click's trace: its ids never reach an argv.
+            words = notifymod.clicked(log, args.token)
+            try:
+                args = ap.parse_args(words)
+            except SystemExit:
+                raise StageError("notify.click", f"the CLI refused the click's words: {words!r}",
+                                 "play the episode from Browse") from None
         if args.cmd == "resolve":
             out = do_resolve(args, log, settings, args.dry_run)
         elif args.cmd == "play":
@@ -6961,8 +6982,6 @@ def main(argv: list[str] | None = None) -> int:
             out = watchermod.run(log, settings)
         elif args.cmd == "prefetch":
             out = do_prefetch(args, log, settings)
-        elif args.cmd == "notify-wait":
-            out = notifymod.wait(log, json.loads(args.spec))
         elif args.cmd == "status":
             out = do_status(log)
         elif args.cmd == "player":

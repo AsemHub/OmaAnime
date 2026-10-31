@@ -216,8 +216,11 @@ def pid_is_play(pid) -> bool | None:
         return None
     args = cmd.split(b"\0")
     # `play` has to be an argument, not a substring: `--trace ui-play-…` rides on several other
-    # commands and would otherwise make a `status` process look like a play.
-    if not (b"play" in args and any(b"omarchy-anime" in a or b"omarchy_anime" in a for a in args)):
+    # commands and would otherwise make a `status` process look like a play. A notification's click
+    # runs its play inside `notify-click <token>` (`notify.clicked`), so that word counts too: the
+    # only other action a click runs, `player resume`, claims nothing and so is never asked about.
+    if not ((b"play" in args or b"notify-click" in args)
+            and any(b"omarchy-anime" in a or b"omarchy_anime" in a for a in args)):
         return False
     # Another plugin with the same CLI name: a pid reused by *its* play, installed in another
     # plugin folder, is not ours to supersede.

@@ -1280,6 +1280,13 @@ var SERVICE_PROPERTIES = [
   "watchingLoaded", "watchingSaved",
 ]
 
+// ServiceLogic.js `cliLaunch`, word for word, for the two stand-ins below (a test compares them).
+function _cliLaunch(head, words) {
+  var env = {}
+  env.OMAANIME_ARGS = JSON.stringify(listCopy(words).map(String))
+  return { command: listCopy(head).map(String), environment: env }
+}
+
 // Every ServiceLogic.js function Browse calls, with its stand-in: the real function's answer for an idle or empty
 // input, in the real shape (a test compares them).
 var LOGIC_FUNCTIONS = {
@@ -1319,16 +1326,22 @@ var LOGIC_FUNCTIONS = {
     return { state: "loading", text: "Loading " + String((o && o.what) || "your list") + "…" }
   },
   torznabListUsable: false,        // "not usable", so no offer is shown
+  // The real two (`docs/privacy.md`), so a launch from Browse keeps the show off the command line however old the
+  // running ServiceLogic.js is: the words in `OMAANIME_ARGS`, which the CLI on disk reads.
+  cliOn: function (proc, head, words) {
+    var launch = _cliLaunch(head, words)
+    proc.environment = launch.environment
+    proc.command = launch.command
+    return launch
+  },
+  logEventLaunch: function (bin, trace, component, stage, data, level) {
+    return _cliLaunch([bin, "--trace", trace, "log-event"],
+                      [String(component), String(stage), "--level", String(level || "info"),
+                       "--data", JSON.stringify(data || {})])
+  },
 }
 
 var SERVICE_RESTART = "omarchy restart shell"
-
-// The argv of one `log-event` line written by Browse itself, for what must not go through the Service's `logEvent`
-// (a stale Service may be the thing being reported). The same shape as Service.qml's `logEvent`/`logService`.
-function logEventArgv(bin, trace, stage, data, level) {
-  return [String(bin), "--trace", String(trace), "log-event", "ui", String(stage), "--level", String(level || "info"),
-          "--data", JSON.stringify(data || {})]
-}
 
 function _bridgeCall(target, name) {
   return function () { return target[name].apply(target, arguments) }

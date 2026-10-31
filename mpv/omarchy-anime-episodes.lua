@@ -50,6 +50,31 @@ local PANEL_Z = 1001     -- the OSC draws at z=1000 (osc.lua v0.41 `set_osd(…,
                          -- third-party list script leaves z at 0 and therefore draws *under* it.
 local RES_Y = 720        -- res_x stays 0 so libass derives it and an ASS pixel stays square.
 
+-- A command line is readable by every account on the computer (`/proc/<pid>/cmdline`, 0444), an environment only by
+-- its owner (0400) (`docs/privacy.md`). So a launch of the plugin's CLI keeps fixed words in `head` (the binary,
+-- `--trace` and the trace, the subcommand) and every word that names the show, the episode or a log line's data in
+-- `words`, which travel in `OMAANIME_ARGS`: a JSON list the CLI appends to its argv and drops before it starts
+-- anything. mpv's `env` is the child's whole environment, in execle()'s format (man mpv 0.41, `subprocess`: "On Lua,
+-- you may use utils.get_env_list() to retrieve the current environment if you e.g. simply want to add a new
+-- variable"), so it is this process's own, without any copy of the variable, plus ours. The other fields of `t` go to
+-- the `subprocess` command as they are.
+local ARGS_ENV = "OMAANIME_ARGS"
+local CHOICE_COMMANDS = { play = "play", later = "later", ["keep-waiting"] = "keep-waiting", player = "player" }
+local function cli_command(t)
+    local env = {}
+    for _, kv in ipairs(utils.get_env_list() or {}) do
+        if kv:sub(1, #ARGS_ENV + 1) ~= ARGS_ENV .. "=" then env[#env + 1] = kv end
+    end
+    local words = {}
+    for i, w in ipairs(t.words or {}) do words[i] = tostring(w) end
+    env[#env + 1] = ARGS_ENV .. "=" .. (#words > 0 and utils.format_json(words) or "[]")
+    local cmd = { name = "subprocess", playback_only = false, env = env, args = t.head }
+    for k, v in pairs(t) do
+        if k ~= "head" and k ~= "words" then cmd[k] = v end
+    end
+    return cmd
+end
+
 -- There used to be a `PENDING_S = 8` here: how long the "finding a release" line stayed up,
 -- and how long a second click was refused for. A play measured 28-43 s in the traces, so the player
 -- looked dead for the other 20-35 s and the second click was always accepted — and a second play
@@ -1179,11 +1204,11 @@ local function log_line(shown, why, measured, e, placed)
         msg.warn("background line not logged: " .. tostring(err))
         return
     end
-    mp.command_native_async({
-        name = "subprocess", playback_only = false, detach = true,
-        args = { opts.bin, "--trace", trace, "log-event", "player.line", shown and "shown" or "none", "--result", why,
-                 "--data", json },
-    }, function(success, result, error)
+    mp.command_native_async(cli_command({
+        detach = true,
+        head = { opts.bin, "--trace", trace, "log-event" },
+        words = { "player.line", shown and "shown" or "none", "--result", why, "--data", json },
+    }), function(success, result, error)
         if not success or (type(result) == "table" and (tonumber(result.status) or 0) < 0) then
             msg.warn("background line log-event failed trace=" .. trace .. " error=" .. tostring(error)
                      .. " status=" .. tostring(type(result) == "table" and result.status))
@@ -1455,10 +1480,7 @@ local function retract_after_failure()
     if opts.bin == "" then return end
     if mp.get_property_native("idle-active") ~= true then return end
     hidden_fail_trace = trace
-    local ok, res = pcall(mp.command_native, {
-        name = "subprocess", playback_only = false, detach = true,
-        args = { opts.bin, "player", "hide" },
-    })
+    local ok, res = pcall(mp.command_native, cli_command({ detach = true, head = { opts.bin, "player", "hide" } }))
     msg.info("failed play trace=" .. trace .. ": hold expired and the player is idle, hiding the"
              .. " window it was shown for (spawn=" .. tostring(ok and res and res.status) .. ")")
 end
@@ -1481,15 +1503,21 @@ local function run_choice(a, e)
         return
     end
     local trace = string.format("mpv-choice-%d-%s", os.time(), tostring(a.id or "choice"))
-    local args = { opts.bin, "--trace", trace }
-    for _, v in ipairs(a.args) do args[#args + 1] = tostring(v) end
+    -- The subcommand stays on the command line, as the shell's `Logic.choiceLaunch` keeps it: a play is told from
+    -- other processes by the word `play` there (`playstate.pid_is_play`). The other words travel in the variable.
+    local head = { opts.bin, "--trace", trace }
+    local words = {}
+    for i, v in ipairs(a.args) do
+        local w = tostring(v)
+        if i == 1 and CHOICE_COMMANDS[w] then head[#head + 1] = CHOICE_COMMANDS[w] else words[#words + 1] = w end
+    end
     if type(a.ack) == "string" and a.ack ~= "" then
         -- "Tell me when it's ready": what the viewer is told is `later`'s own answer (its `message`), read when the
         -- command returns, so "We'll tell you" is said only when the request was recorded, and "That couldn't be
         -- saved" reaches the viewer too. Async: the player never waits on it. `--no-hide`: the window stays up while
         -- the answer is read, and this script hides it `LATER_HIDE_S` later, only when the request was recorded.
-        if a.id == "later" then args[#args + 1] = "--no-hide" end
-        mp.command_native_async({ name = "subprocess", playback_only = false, capture_stdout = true, args = args },
+        if a.id == "later" then words[#words + 1] = "--no-hide" end
+        mp.command_native_async(cli_command({ capture_stdout = true, head = head, words = words }),
             function(success, result, err)
                 local answer = success and type(result) == "table" and utils.parse_json(result.stdout or "") or nil
                 local said = type(answer) == "table" and type(answer.message) == "string" and answer.message or ""
@@ -1507,8 +1535,9 @@ local function run_choice(a, e)
                                      .. tostring(e.trace))
                             return
                         end
-                        local hid = mp.command_native({ name = "subprocess", playback_only = false, detach = true,
-                                                        args = { opts.bin, "--trace", trace, "player", "hide" } })
+                        local hid = mp.command_native(cli_command({ detach = true,
+                                                                    head = { opts.bin, "--trace", trace, "player",
+                                                                             "hide" } }))
                         msg.info("choice later hide trace=" .. trace .. " spawn=" .. tostring(hid and hid.status))
                     end)
                 elseif type(answer) == "table" and answer.later == true then
@@ -1523,7 +1552,7 @@ local function run_choice(a, e)
         -- "Keep waiting" during the wait (`keep-waiting`): its answer is read, as `later`'s is, so a press that reached
         -- no waiting play (it left its wait meanwhile) says so ("Episode 3 is not waiting for TorBox.") instead of
         -- "Keep waiting". Async: the player never waits on it.
-        mp.command_native_async({ name = "subprocess", playback_only = false, capture_stdout = true, args = args },
+        mp.command_native_async(cli_command({ capture_stdout = true, head = head, words = words }),
             function(success, result, err)
                 local answer = success and type(result) == "table" and utils.parse_json(result.stdout or "") or nil
                 local confirmed = type(answer) == "table" and answer.confirmed == true
@@ -1539,7 +1568,7 @@ local function run_choice(a, e)
                  .. trace .. " asked")
         return
     end
-    local res = mp.command_native({ name = "subprocess", playback_only = false, detach = true, args = args })
+    local res = mp.command_native(cli_command({ detach = true, head = head, words = words }))
     msg.info("choice " .. tostring(a.id) .. " for episode " .. ep_num(e) .. " (play trace=" .. tostring(e.trace)
              .. ") trace=" .. trace .. " spawn=" .. tostring(res and res.status))
     mp.osd_message(tostring(a.label or ""), 3)
@@ -1678,10 +1707,11 @@ local function play(index)
     -- one timeline under a recognisable name.
     local trace = string.format("mpv-%d-%d", os.time(), ep.episode)
     launched.trace = trace
-    local res = mp.command_native({
-        name = "subprocess", playback_only = false, detach = true,
-        args = { opts.bin, "--trace", trace, "play", tostring(data.mediaId), tostring(ep.episode) },
-    })
+    local res = mp.command_native(cli_command({
+        detach = true,
+        head = { opts.bin, "--trace", trace, "play" },
+        words = { tostring(data.mediaId), tostring(ep.episode) },
+    }))
     -- `detach` returns immediately and reports nothing about the play itself — that is what made
     -- every failure invisible. The outcome now arrives through the status file, not from here.
     msg.info("play episode " .. ep.episode .. " trace=" .. trace ..

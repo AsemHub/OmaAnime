@@ -47,6 +47,7 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -195,7 +196,7 @@ def _part(final: pathlib.Path) -> pathlib.Path:
     return final.with_name(f"{final.name}.part.{os.getpid()}.{threading.get_ident():x}")
 
 
-def _run_ffmpeg(args: list[str], outputs: list[tuple[pathlib.Path, int | None]],
+def _run_ffmpeg(src: pathlib.Path, args: list[str], outputs: list[tuple[pathlib.Path, int | None]],
                 timeout_s: float = FFMPEG_TIMEOUT_S, log: Log | None = None) -> bool:
     """Run one ffmpeg command whose outputs are `.part` files; on success rename every output into
     place, on any failure delete every `.part`. `outputs` is (final_path, expected_size or None
@@ -210,14 +211,25 @@ def _run_ffmpeg(args: list[str], outputs: list[tuple[pathlib.Path, int | None]],
     `log` is diagnosis only, never a dependency: with one, a failure says which ffmpeg exit code or
     which size mismatch it was, what ffmpeg itself said, and the exact argv to re-run by hand
     (the caller's own FAIL line knows the episode, not the reason). Without one every
-    conversion behaves exactly as before and still just returns False."""
+    conversion behaves exactly as before and still just returns False.
+
+    ffmpeg reads `src` on its stdin (`-i pipe:0`; it tells a JPEG, PNG or WebP from its bytes) and runs in the
+    outputs' folder, where `args` names each output by its `_part` name alone: neither the picture's cached name (the
+    hash of its address) nor the show's folder (its AniList id) is on ffmpeg's command line, which every account on the
+    computer can read; its working folder (`/proc/<pid>/cwd`) only its owner can."""
     parts = [(final, _part(final), size) for final, size in outputs]
-    argv = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_pixels", str(FFMPEG_MAX_PIXELS), *args]
+    cwd = outputs[0][0].parent
+    argv = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-max_pixels", str(FFMPEG_MAX_PIXELS),
+            "-i", "pipe:0", *args]
+    # The log's re-run, pasteable into a shell (a filter graph holds `;` and `[a]`): the private log may name both.
+    by_hand = f"cd {shlex.quote(str(cwd))} && {shlex.join(argv)} < {shlex.quote(str(src))}"
     try:
         for final, _, _ in parts:
             core.private_dir(final.parent)
         # umask 077: ffmpeg's `.part` outputs are 600 from the first byte, as every other cache file.
-        out = subprocess.run(argv, capture_output=True, timeout=max(0.2, float(timeout_s)), umask=0o077)
+        with open(src, "rb") as picture:
+            out = subprocess.run(argv, stdin=picture, capture_output=True, cwd=cwd,
+                                 timeout=max(0.2, float(timeout_s)), umask=0o077)
         ok = out.returncode == 0
         sizes = []
         for _, part, size in parts:
@@ -235,15 +247,15 @@ def _run_ffmpeg(args: list[str], outputs: list[tuple[pathlib.Path, int | None]],
             # ffmpeg names a picture past `-max_pixels` early in its stderr; the tail below would cut it.
             big = re.search(r"Picture size (\d+x\d+) exceeds specified max pixel count (\d+)", err)
             log.warn("thumbs", "ffmpeg", result="FAIL", rc=out.returncode, stderr=err[-200:],
-                     sizes="; ".join(sizes), cmd=" ".join(argv),
+                     sizes="; ".join(sizes), cmd=by_hand,
                      **({"picture": big.group(1), "max_pixels": int(big.group(2))} if big else {}),
                      suggest="the source image has more pixels than a still may; not converted" if big else
-                     "run the argv by hand; a source ffmpeg cannot decode renders as no picture")
+                     "run cmd by hand; a source ffmpeg cannot decode renders as no picture")
     except (OSError, subprocess.SubprocessError) as exc:
         if log is not None:
             log.warn("thumbs", "ffmpeg", result="FAIL", rc=None,
-                     stderr=f"{type(exc).__name__}: {exc}"[-200:], sizes="", cmd=" ".join(argv),
-                     suggest="run the argv by hand; a timeout here means the deadline was already spent")
+                     stderr=f"{type(exc).__name__}: {exc}"[-200:], sizes="", cmd=by_hand,
+                     suggest="run cmd by hand; a timeout here means the deadline was already spent")
     for _, part, _ in parts:
         try:
             part.unlink(missing_ok=True)
@@ -266,20 +278,20 @@ def convert_forms(src: pathlib.Path, media_id: int, episode: int, w: int, h: int
     still = still_blur_path(media_id, episode)
     graph = (f"[0:v]scale={int(w)}:{int(h)},split=2[a][b];[b]gblur=sigma={_sigma(w)}[c];"
              f"[0:v]scale={STILL_W}:{STILL_H},gblur=sigma={_sigma(STILL_W)}[d]")
-    args = ["-i", str(src), "-filter_complex", graph,
-            "-map", "[a]", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgra", str(_part(crisp)),
-            "-map", "[c]", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgra", str(_part(blur)),
-            "-map", "[d]", "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", str(_part(still))]
+    args = ["-filter_complex", graph,
+            "-map", "[a]", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgra", _part(crisp).name,
+            "-map", "[c]", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgra", _part(blur).name,
+            "-map", "[d]", "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", _part(still).name]
     want = int(w) * int(h) * 4
-    return _run_ffmpeg(args, [(crisp, want), (blur, want), (still, None)], timeout_s=timeout_s, log=log)
+    return _run_ffmpeg(src, args, [(crisp, want), (blur, want), (still, None)], timeout_s=timeout_s, log=log)
 
 
 def convert_fanart_blur(src: pathlib.Path, media_id: int, timeout_s: float = FFMPEG_TIMEOUT_S,
                         log: Log | None = None) -> bool:
     dest = fanart_blur_path(media_id)
-    args = ["-i", str(src), "-vf", f"scale={BACKDROP_W}:{BACKDROP_H},gblur=sigma={_sigma(BACKDROP_W)}",
-            "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", str(_part(dest))]
-    return _run_ffmpeg(args, [(dest, None)], timeout_s=timeout_s, log=log)
+    args = ["-vf", f"scale={BACKDROP_W}:{BACKDROP_H},gblur=sigma={_sigma(BACKDROP_W)}",
+            "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", _part(dest).name]
+    return _run_ffmpeg(src, args, [(dest, None)], timeout_s=timeout_s, log=log)
 
 
 def convert_logo(src: pathlib.Path, media_id: int, w: int, h: int,
@@ -289,8 +301,8 @@ def convert_logo(src: pathlib.Path, media_id: int, w: int, h: int,
     dest = logo_path(media_id, w, h)
     vf = (f"format=rgba,premultiply=inplace=1,scale={int(w)}:{int(h)}:force_original_aspect_ratio=decrease,"
           f"pad={int(w)}:{int(h)}:(ow-iw)/2:(oh-ih)/2:color=black@0.0")
-    args = ["-i", str(src), "-vf", vf, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgra", str(_part(dest))]
-    return _run_ffmpeg(args, [(dest, int(w) * int(h) * 4)], timeout_s=timeout_s, log=log)
+    args = ["-vf", vf, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgra", _part(dest).name]
+    return _run_ffmpeg(src, args, [(dest, int(w) * int(h) * 4)], timeout_s=timeout_s, log=log)
 
 
 def make_backdrop(src_jpg, w: int, h: int, timeout_s: float = FFMPEG_TIMEOUT_S,
@@ -321,9 +333,9 @@ def make_backdrop(src_jpg, w: int, h: int, timeout_s: float = FFMPEG_TIMEOUT_S,
         return ""
     dest = backdrop_path(w, h)
     want = int(w) * int(h) * 4
-    args = ["-i", str(src), "-vf", f"crop=iw:iw*27/64,scale={int(w)}:{int(h)}", "-frames:v", "1",
-            "-f", "rawvideo", "-pix_fmt", "bgra", str(_part(dest))]
-    return str(dest) if _run_ffmpeg(args, [(dest, want)], timeout_s=timeout_s, log=log) else ""
+    args = ["-vf", f"crop=iw:iw*27/64,scale={int(w)}:{int(h)}", "-frames:v", "1",
+            "-f", "rawvideo", "-pix_fmt", "bgra", _part(dest).name]
+    return str(dest) if _run_ffmpeg(src, args, [(dest, want)], timeout_s=timeout_s, log=log) else ""
 
 
 def forms(media_id: int, episode: int, w: int, h: int) -> dict:

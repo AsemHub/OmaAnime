@@ -15,6 +15,7 @@ the README's [Install](../README.md#install).
 | Your Torznab servers and their API keys | `~/.config/omaanime/torznab-servers.json`, mode 600, beside the tokens and kept the same way: never in `shell.json`, a log line or a command line (Settings sends the key to the CLI over stdin), shown by its last four characters (none under 16), and not read while others can read it. Written only by **Add** and **Remove** in Accounts (or `omarchy-anime torznab`), one at a time under a lock, which keep any field they do not know, read it back, and refuse to rewrite a file they could not read whole |
 | Caches: AniList lists, the shows around a later season, or a first season whose releases state a part (`anilist/franchise/`, 8 days; a day while a related show's count is not known or none is related; up to 30 days while AniList cannot be read), ani.zip mappings, covers and episode pictures, the last search per episode, borrowed and external subtitles, pins, resume positions, progress writes not yet sent, what was learned about groups, each add-on's own cache (`indexers/<name>/`; for Torznab, `indexers/torznab/`: each feed's capabilities, a refusal such as a wrong key for 10 minutes, a pause a feed asked for, and in `servers/` what each server is and a Prowlarr's indexer ids, names and priorities, with a fingerprint of the key, never a key) | `~/.cache/omaanime/`, each file mode 600 in folders at 700 from the moment it is written (a folder an earlier build made wider is tightened on the next write). Covers and pictures prune themselves (30 days, and a size limit), the borrowed subtitles keep 30 days and `subsCacheMaxBytes`, and the external subtitles 30 days; all of it can be deleted |
 | The log | `~/.cache/omaanime/log/<date>.jsonl`, mode 600 in a folder at 700, kept 14 days |
+| What a notification's click plays (the AniList id, the episode, the release) | `~/.cache/omaanime/notify-clicks/<token>.json`, mode 600 in a folder at 700, the newest 200 kept. The notification carries only the token |
 
 **Every log line is scrubbed as it is written.** A URL keeps its host and path and loses any
 credential parameter (`?token=`, `api_key=`, `passkey=` and similar) and any user name or password
@@ -24,6 +25,11 @@ command saved meanwhile; and `omarchy-anime trace` scrubs again when it renders.
 in the plugin's own output by its last four characters only. `omarchy-anime trace`, which a bug report asks for,
 prints a service's control characters as `\xNN` (`\u00NN` in its `--json` and `--tail` forms; never as bytes your
 terminal would act on) and your home folder as `~`.
+
+**A notification** ("Tell me when it's ready", an episode that loaded paused, an entry not out yet) goes from the
+plugin's own process to the desktop's notification server over the session bus: the show's title and the episode
+are never on a command line, where any account on the machine could read them (`/proc/<pid>/cmdline`). Its click
+runs `omarchy-anime --trace <id> notify-click <token>`, a random token naming the file above.
 
 **Signing out** (`omarchy-anime signout <name>`, or **Sign out** in Accounts) deletes the token file, a copy a
 killed save left behind, and `accounts.json`, and:
@@ -38,6 +44,24 @@ killed save left behind, and `accounts.json`, and:
 
 Signing in again, or with another account, removes `accounts.json`, AniList's cached lists (for an AniList sign-in)
 and the queued writes that name no account; the other records above stay.
+
+### What other accounts on this computer can see
+
+A program's command line is readable by every account on the computer (`ps`, `/proc/<pid>/cmdline`); its environment
+and its working folder only by you. So no process the plugin starts, from the shell, the player or the command
+itself, has what you watch on its command line: no AniList id, title, release or file name, info hash, address or
+search text. Its command line holds the command and its fixed words (`omarchy-anime --trace <id> play`), the trace id
+(an action, a time, a random part, at most an episode number), a notification click's random token, and at most a
+language, a font, a sign-in page or the setup prompt you hand your AI agent. Everything else travels in the
+`OMAANIME_ARGS` environment variable, a JSON list of words that `omarchy-anime` adds after its own arguments and
+removes from its environment before it starts anything, so nothing it starts inherits it. Thumbnail conversion
+(`ffmpeg`) reads the picture on its input and writes in the plugin's thumbnail cache: the show's own folder there, or
+the cache itself for the one shared backdrop. So neither the show's id nor the picture's cached name is on its command
+line. The log still records the whole command (`cli start`, with how many of its words came in the variable), in its
+private file.
+
+What you type into a terminal yourself, `omarchy-anime play <id> <episode>` for instance, is on that command's line
+as you typed it; a script that wants it private sets `OMAANIME_ARGS='["<id>", "<episode>"]'` instead.
 
 ### What is sent, and to whom
 

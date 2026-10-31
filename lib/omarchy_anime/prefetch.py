@@ -41,11 +41,10 @@ import json
 import os
 import random
 import subprocess
-import sys
 import time
 from pathlib import Path
 
-from . import core, notify, playstate, searches, torznab_servers
+from . import core, notify, playstate, private_args, searches, torznab_servers
 from . import providers as providersmod
 from .anilist import next_episode
 # CACHE_DIR is rebound by the tests.
@@ -94,7 +93,6 @@ QUEUED_PATH = "/queued/getqueued"
 # 300 requests a minute per token), each one writing the play's status, so it never reads as a play gone silent.
 QUEUE_POLL_S = 6.0
 QUEUED_WORDS = "TorBox has it queued, waiting for a free download slot."
-BIN = notify.BIN
 _clock = time.time
 _spawn = subprocess.Popen
 
@@ -317,19 +315,21 @@ def wanted(now_playing: dict, episode: int, pos: float, settings: dict) -> tuple
     return nxt["episode"], f"{float(pos):g} s into episode {episode}; episode {nxt['episode']} has aired"
 
 
-def new_trace(media_id, episode) -> str:
-    """The prefetch's own trace id: `omarchy-anime trace <it>` shows its search, its one add or why there was none."""
-    return f"prefetch-{int(media_id)}-{int(episode)}-{int(_clock())}-{random.randrange(16**4):04x}"
+def new_trace() -> str:
+    """The prefetch's own trace id: `omarchy-anime trace <it>` shows its search, its one add or why there was none. Time
+    and a random part only: it is on the prefetch's command line, where any account can read it (`private_args`)."""
+    return f"prefetch-{int(_clock())}-{random.randrange(16**4):04x}"
 
 
 def start(log: Log, media_id: int, episode: int, from_episode: int, trace: str) -> int | None:
     """Start `omarchy-anime --trace <trace> prefetch <mediaId> <episode>` detached, with no pipes: its pid, or None when
-    it could not be started (logged and recorded; the latch stays, so nothing retries it)."""
-    argv = [sys.executable, str(BIN), "--trace", trace, "prefetch", str(int(media_id)), str(int(episode)),
-            "--from", str(int(from_episode))]
+    it could not be started (logged and recorded; the latch stays, so nothing retries it). The show and the episodes
+    go in `OMAANIME_ARGS`, not on the command line (`private_args`)."""
+    argv, env = private_args.command(["--trace", trace, "prefetch"],
+                                     [str(int(media_id)), str(int(episode)), "--from", str(int(from_episode))])
     try:
         proc = _spawn(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                      start_new_session=True, close_fds=True)
+                      start_new_session=True, close_fds=True, env=env)
     except OSError as exc:
         log.warn("prefetch", "spawn", result="FAIL", mediaId=media_id, episode=episode, error=str(exc),
                  prefetch_trace=trace, suggest="the next episode is not downloaded ahead; its play adds it as before")

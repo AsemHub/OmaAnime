@@ -194,7 +194,7 @@ Item {
     if (!report) return
     root.menuWarned[report.key] = true
     var trace = (root.service ? root.svc.newTrace("settings") : "") || ("ui-settings-" + Math.floor(Date.now() / 1000))
-    Quickshell.execDetached(Model.logEventArgv(root.bin, trace, "settings.menuEmpty", report, "warn"))
+    Quickshell.execDetached(root.logic.logEventLaunch(root.bin, trace, "ui", "settings.menuEmpty", report, "warn"))
   }
 
   function settingSource(key) {
@@ -578,9 +578,9 @@ Item {
       root.openTrace = trace
       root.svc.logEvent(trace, "browse.open", { view: root.view, mediaId: payload.mediaId || null })
       if (stale && root.bin)
-        Quickshell.execDetached(Model.logEventArgv(root.bin, trace, "browse.serviceStale",
-                                                   { view: root.view, missing: root.bridge.missing,
-                                                     fix: "omarchy restart shell" }, "warn"))
+        Quickshell.execDetached(root.logic.logEventLaunch(root.bin, trace, "ui", "browse.serviceStale",
+                                                         { view: root.view, missing: root.bridge.missing,
+                                                           fix: "omarchy restart shell" }, "warn"))
       root.svc.refreshWatching()
       root.noteRowsShown()
     }
@@ -715,7 +715,7 @@ Item {
 
   function warmCovers(view) {
     if (!bin || coversProc.running) return
-    var argv = [bin, "covers", "warm", "--budget", "8"]
+    var words = ["--budget", "8"]
     if (view === "search") {
       var ids = [], bad = []
       for (var i = 0; i < searchList.length; i++) {
@@ -730,17 +730,17 @@ Item {
       if (ids.length === 0) return
       // A search result is not on disk anywhere, and a 10-row search must not pay a second AniList
       // call: the CLI reads the cover URLs out of its own title cache, so `--media` is enough.
-      argv = argv.concat(["--media"]).concat(ids)
+      words = words.concat(["--media"]).concat(ids)
     } else {
       if (coversDone[view]) return
       var done = coversDone
       done[view] = true
       coversDone = done
-      argv = argv.concat(["--view", view])
+      words = words.concat(["--view", view])
     }
     coversView = view
     coversT0 = Date.now()
-    coversProc.command = argv
+    root.logic.cliOn(coversProc, [bin, "covers", "warm"], words)
     coversProc.running = true
   }
 
@@ -914,8 +914,8 @@ Item {
     root.listsLoading = true
     listsProc.status = status
     listsProc.superseded = false
-    listsProc.command = force || stale ? [bin, "list", "--status", status, "--refresh"]
-                                       : [bin, "list", "--status", status]
+    root.logic.cliOn(listsProc, [bin, "list"],
+                     force || stale ? ["--status", status, "--refresh"] : ["--status", status])
     listsProc.running = true
   }
 
@@ -958,7 +958,7 @@ Item {
     if (ids.length === 0) return
     coversView = "lists"
     coversT0 = Date.now()
-    coversProc.command = [bin, "covers", "warm", "--budget", "8", "--media"].concat(ids)
+    root.logic.cliOn(coversProc, [bin, "covers", "warm"], ["--budget", "8", "--media"].concat(ids))
     coversProc.running = true
   }
 
@@ -1008,7 +1008,7 @@ Item {
     searchExpectedStop = false
     searchInFlight = searchSerial
     searchLoading = true
-    searchProc.command = [bin, "search", q, "--limit", "10"]
+    root.logic.cliOn(searchProc, [bin, "search"], [q, "--limit", "10"])
     searchProc.running = true
   }
 
@@ -1076,7 +1076,7 @@ Item {
     root.startingEpisode = Number(row.episode) || 1
     if (root.service) root.svc.logEvent(root.svc.newTrace("browse-start"), "ui.browse.start",
                                         { mediaId: root.startingMediaId, status: root.listStatus })
-    startProc.command = [bin, "progress", String(row.mediaId), "0"]
+    root.logic.cliOn(startProc, [bin, "progress"], [row.mediaId, "0"])
     startProc.running = true
   }
 
@@ -1160,7 +1160,7 @@ Item {
   function loadPin() {
     if (!bin || !detailMediaId || pinProc.running) return
     pinProc.forMedia = detailMediaId
-    pinProc.command = [bin, "pin", "show", String(detailMediaId)]
+    root.logic.cliOn(pinProc, [bin, "pin", "show"], [detailMediaId])
     pinProc.running = true
   }
 
@@ -1169,7 +1169,7 @@ Item {
     if (!bin || !root.pickerMediaId || forgetPinProc.running) return
     var trace = service ? root.svc.newTrace("pin") : "pin"
     if (service) root.svc.logEvent(trace, "ui.pin.forget", { mediaId: root.pickerMediaId })
-    forgetPinProc.command = [bin, "--trace", trace, "pin", "forget", String(root.pickerMediaId)]
+    root.logic.cliOn(forgetPinProc, [bin, "--trace", trace, "pin", "forget"], [root.pickerMediaId])
     forgetPinProc.running = true
   }
 
@@ -1189,7 +1189,7 @@ Item {
     detailLoading = true
     root.detailT0 = Date.now()
     root.detailProcMediaId = detailMediaId
-    detailProc.command = [bin, "media", String(detailMediaId)]
+    root.logic.cliOn(detailProc, [bin, "media"], [detailMediaId])
     detailProc.running = true
   }
 
@@ -1198,9 +1198,8 @@ Item {
     var trace = service ? root.svc.newTrace("browse-episodes") : ""
     root.episodesTrace = trace
     root.episodesProcMediaId = detailMediaId
-    var argv = [bin]
-    if (trace) argv = argv.concat(["--trace", trace])
-    episodesProc.command = argv.concat(["episodes", String(detailMediaId), "--write", "--fetch"])
+    root.logic.cliOn(episodesProc, trace ? [bin, "--trace", trace, "episodes"] : [bin, "episodes"],
+                     [detailMediaId, "--write", "--fetch"])
     episodesProc.running = true
   }
 
@@ -1243,9 +1242,8 @@ Item {
     settingWatching = true
     var trace = service ? root.svc.newTrace("browse-watching") : ""
     if (service) root.svc.logEvent(trace, "browse.setWatching", { mediaId: detailMediaId, progress: progress })
-    var argv = [bin]
-    if (trace) argv = argv.concat(["--trace", trace])
-    watchProc.command = argv.concat(["progress", String(detailMediaId), String(progress)])
+    root.logic.cliOn(watchProc, trace ? [bin, "--trace", trace, "progress"] : [bin, "progress"],
+                     [detailMediaId, progress])
     watchProc.running = true
   }
 

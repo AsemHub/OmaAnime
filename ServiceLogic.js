@@ -385,14 +385,58 @@ function playOverWait(play, ownTrace, mediaId, episode, nowSec, release) {
   return !same || (!!release && !!play.choice)
 }
 
-// The argv one of a waiting play's choices runs (`cli.wait_choice`'s `args`, Browse's button and the player's key
-// alike): the plugin's binary, the trace the click was logged under, then the command. Empty when there is none.
-function choiceArgv(bin, trace, args) {
-  if (!bin || !isList(args) || args.length === 0) return []
-  return [String(bin), "--trace", String(trace)].concat(listCopy(args).map(String))
+// ------------------------------------------------------------------------- the CLI's private words
+// A command line is readable by every account on the computer (`/proc/<pid>/cmdline`, 0444); an environment only by
+// its owner (`/proc/<pid>/environ`, 0400). So a launch of the plugin's CLI puts fixed words on its command line (the
+// binary, `--trace` and the trace, the subcommand) and every other word, the show, an episode, a release, a search, a
+// log line's data, in `OMAANIME_ARGS`, a JSON list the CLI appends to its argv and drops from its environment before
+// it starts anything (`bin/omarchy-anime`, `private_args.py`; `docs/privacy.md`). A test holds every command array in
+// the QML, the JS and the player script to that.
+var ARGS_ENV = "OMAANIME_ARGS"
+
+// One launch: Quickshell's `execDetached` object form, `{command, environment}` (the calling file must import
+// Quickshell.Io, or the object form throws), whose environment is added to the shell's. Always the variable, `[]`
+// when there are no words.
+function cliLaunch(head, words) {
+  var env = {}
+  env[ARGS_ENV] = JSON.stringify(listCopy(words).map(String))
+  return { command: listCopy(head).map(String), environment: env }
 }
 
-// Why `choiceArgv` gives nothing to run, for the log; "" when it gives an argv.
+// The same launch on a Process, both properties every time, so a reused Process never hands a run the last run's
+// words. Started by the caller (`running = true`).
+function cliOn(proc, head, words) {
+  var launch = cliLaunch(head, words)
+  proc.environment = launch.environment
+  proc.command = launch.command
+  return launch
+}
+
+// One `log-event` line: the component, the stage, the level and `data` (which names shows and releases) in the
+// variable. Browse launches it itself for what must not go through the Service's `logEvent` (a stale Service may be
+// the thing being reported).
+function logEventLaunch(bin, trace, component, stage, data, level) {
+  return cliLaunch([bin, "--trace", trace, "log-event"],
+                   [String(component), String(stage), "--level", String(level || "info"),
+                    "--data", JSON.stringify(data || {})])
+}
+
+// The CLI's subcommands a choice runs. One of them stays on the command line: a play is told from other processes by
+// the word `play` there (`playstate.pid_is_play`), and the word says nothing about the show.
+var CHOICE_COMMANDS = ["play", "later", "keep-waiting", "player"]
+
+// The launch one of a waiting play's choices runs (`cli.wait_choice`'s `args`, Browse's button and the player's key
+// alike): the plugin's binary, the trace the click was logged under and the subcommand, then the command's other words
+// in the variable (they name the show and the release). null when there is none.
+function choiceLaunch(bin, trace, args) {
+  if (!bin || !isList(args) || args.length === 0) return null
+  var words = listCopy(args).map(String)
+  var at = CHOICE_COMMANDS.indexOf(words[0])
+  if (at < 0) return cliLaunch([bin, "--trace", trace], words)
+  return cliLaunch([bin, "--trace", trace, CHOICE_COMMANDS[at]], words.slice(1))
+}
+
+// Why `choiceLaunch` gives nothing to run, for the log; "" when it gives a launch.
 function choiceRefusal(bin, args) {
   if (!bin) return "no plugin binary"
   if (!isList(args)) return "the button's args are not a list (" + Object.prototype.toString.call(args) + ")"

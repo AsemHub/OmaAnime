@@ -57,7 +57,10 @@ Omarchy shell (Quickshell)                      Python CLI (standard library onl
 | `pins.py`, `searches.py` | a viewer's remembered pick per show, and each episode's last search for the release list |
 | `covers.py`, `thumbs.py` | cover images and episode stills, downloaded and converted by the CLI, never by the shell |
 | `say.py` | every sentence a viewer reads, kept apart from the log's words |
+| `notify.py` | desktop notifications: one `Notify` call on the session bus, the click as a token naming a private file, the ready sound |
+| `sessionbus.py` | the plugin's own D-Bus client (standard library): the address, `AUTH EXTERNAL`, `Hello`, one call and its reply |
 | `trace.py` | renders one trace id from the log as a timeline |
+| `private_args.py` | the words a launch keeps off its command line: `OMAANIME_ARGS`, read and dropped by the command's entry, built for the CLI's own launches |
 
 ## One play
 

@@ -54,8 +54,8 @@ HOUSEKEEPING: dict[str, frozenset | None] = {
     "status": None, "watching": None, "list": None, "top": None, "airing": None, "search": None, "media": None,
     "accounts": None, "torbox-user": None, "rd-user": None, "anizip": None, "episodes": None, "covers": None,
     "thumbs": None, "flush-progress": None, "tick": None, "picker-notice": None, "log-event": None, "trace": None,
-    # The pending downloads' watcher and a notification's waiting child run in the background, on their own.
-    "watch": None, "notify-wait": None,
+    # The pending downloads' watcher runs in the background, on its own (a notification's click is the viewer's).
+    "watch": None,
     # The next episode's download at TorBox, which the tick starts by itself (`prefetch`).
     "prefetch": None,
     "pin": frozenset({"show"}), "groupstats": frozenset({"report"}), "subs": frozenset({"status", "prune"}),

@@ -209,8 +209,9 @@ def lean_trace(argv: list[str]) -> str | None:
     return None
 
 
-def main(argv: list[str]) -> int:
-    """`cli.main` for `status` alone: the same trace id, `cli start`/`end` lines, clamp notes, output and exits."""
+def main(argv: list[str], from_env: int = 0) -> int:
+    """`cli.main` for `status` alone: the same trace id, `cli start`/`end` lines, clamp notes, output and exits.
+    `from_env`: how many of `argv`'s words came in `OMAANIME_ARGS` (`private_args.take`)."""
     given = lean_trace(argv)
     if given is None:
         raise ValueError(f"status.main answers only `status` and `--trace T status`, not {argv!r}")
@@ -218,7 +219,7 @@ def main(argv: list[str]) -> int:
     os.environ["OMARCHY_ANIME_TRACE"] = trace
     log = Log(trace)
     t0 = time.monotonic()
-    log.info("cli", "start", cmd="status", argv=safe_argv(argv), version=VERSION)
+    log.info("cli", "start", cmd="status", argv=safe_argv(argv), fromEnv=from_env, version=VERSION)
     try:
         load_settings()
         report_setting_notes(log, core.CONFIG_DIR)

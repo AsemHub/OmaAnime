@@ -196,7 +196,7 @@ Item {
 
   function logEvent(trace, stage, data) {
     if (!bin) return
-    Quickshell.execDetached([bin, "--trace", trace, "log-event", "ui", stage, "--data", JSON.stringify(data || {})])
+    Quickshell.execDetached(Logic.logEventLaunch(bin, trace, "ui", stage, data))
   }
 
   // The service's own lifecycle, under component "service" in the same JSONL the CLI writes, and
@@ -205,9 +205,7 @@ Item {
   // file ever wrote a line.
   function logService(stage, data, level) {
     if (!bin) return
-    Quickshell.execDetached([bin, "--trace", socketTrace || newTrace("socket"), "log-event", "service",
-                             String(stage), "--level", String(level || "info"),
-                             "--data", JSON.stringify(data || {})])
+    Quickshell.execDetached(Logic.logEventLaunch(bin, socketTrace || newTrace("socket"), "service", stage, data, level))
   }
 
   // ---------------------------------------------------------------- actions
@@ -216,7 +214,7 @@ Item {
     var trace = newTrace(action)
     lastTrace = trace
     logEvent(trace, "click", { action: action, args: args })
-    Quickshell.execDetached([bin, "--trace", trace].concat(args))
+    Quickshell.execDetached(Logic.cliLaunch([bin, "--trace", trace], args))
     if (Logic.socketExpects(args)) expectPlayer(action)
     settle.restart()
     return trace
@@ -431,7 +429,7 @@ Item {
     logEvent(trace, "ui.accounts.signin", { provider: String(provider) })   // never the secret
     authProc.provider = String(provider)
     authProc.secret = String(secret)
-    authProc.command = [bin, "--trace", trace, "auth", String(provider), "--token", "-"]
+    Logic.cliOn(authProc, [bin, "--trace", trace, "auth"], [provider, "--token", "-"])
     authProc.running = true
     return true
   }
@@ -662,7 +660,7 @@ Item {
     var trace = newTrace("signout")
     logEvent(trace, "ui.accounts.signout", { provider: String(provider) })
     signOutProc.provider = String(provider)
-    signOutProc.command = [bin, "--trace", trace, "signout", String(provider)]
+    Logic.cliOn(signOutProc, [bin, "--trace", trace, "signout"], [provider])
     signOutProc.running = true
     return true
   }
@@ -705,7 +703,7 @@ Item {
     torznabBusy = "check:" + String(id)
     torznabCheckProc.row = String(row)
     torznabCheckProc.answered = false
-    torznabCheckProc.command = [bin, "--trace", trace, "torznab", "check", "--id", String(id)]
+    Logic.cliOn(torznabCheckProc, [bin, "--trace", trace, "torznab", "check"], ["--id", id])
     torznabCheckProc.running = true
     return true
   }
@@ -717,7 +715,7 @@ Item {
     torznabBusy = "remove:" + String(id)
     torznabAnswer = null
     torznabRemoveProc.row = String(row)
-    torznabRemoveProc.command = [bin, "--trace", trace, "torznab", "remove", "--id", String(id)]
+    Logic.cliOn(torznabRemoveProc, [bin, "--trace", trace, "torznab", "remove"], ["--id", id])
     torznabRemoveProc.running = true
     return true
   }
@@ -981,14 +979,16 @@ Item {
       // This Service's play is waiting for TorBox (that can last hours): another episode or show, or a release picked
       // for this one, goes ahead, detached like a play from the player's own list, and its claim supersedes the wait.
       // It is narrated off the poll.
-      var over = newTrace("play")
-      logEvent(over, "play.over_wait", { mediaId: Number(mediaId), episode: Number(episode), release: release || null,
-                                         waiting: { trace: lastTrace, mediaId: playMediaId, episode: playEpisode } })
-      var overArgv = [bin, "--trace", over, "play", String(mediaId), String(episode), "--show"]
-      if (release) overArgv = overArgv.concat(["--release", String(release)])
-      Quickshell.execDetached(overArgv)
+      var overTrace = newTrace("play")
+      logEvent(overTrace, "play.over_wait", { mediaId: Number(mediaId), episode: Number(episode),
+                                              release: release || null,
+                                              waiting: { trace: lastTrace, mediaId: playMediaId,
+                                                         episode: playEpisode } })
+      var overWords = [mediaId, episode, "--show"]
+      if (release) overWords = overWords.concat(["--release", release])
+      Quickshell.execDetached(Logic.cliLaunch([bin, "--trace", overTrace, "play"], overWords))
       expectPlayer("play")
-      return over
+      return overTrace
     }
     if (playProc.running) {
       playRefusal = Logic.playRefusalText({ mediaId: playMediaId, episode: playEpisode },
@@ -1015,9 +1015,9 @@ Item {
     logEvent(trace, "click", { action: "play", mediaId: mediaId, episode: episode, release: release || null })
     // `--no-notify`: this Process reads the answer and shows it, so a play refused before it starts (an entry that is
     // not out yet) is not also a notification.
-    var argv = [bin, "--trace", trace, "play", String(mediaId), String(episode), "--show", "--no-notify"]
-    if (release) argv = argv.concat(["--release", String(release)])
-    playProc.command = argv
+    var words = [mediaId, episode, "--show", "--no-notify"]
+    if (release) words = words.concat(["--release", release])
+    Logic.cliOn(playProc, [bin, "--trace", trace, "play"], words)
     playProc.running = true
     expectPlayer("play")
     return trace
@@ -1028,28 +1028,29 @@ Item {
   // waiting play (which may be this Service's own `playProc`; it then exits with `superseded`, not an error) and is
   // narrated through `status.play` like any play started elsewhere. Returns the click's trace, or "".
   function runChoice(button) {
-    var argv = Logic.choiceArgv(bin, newTrace("choice"), button ? button.args : null)
-    if (argv.length === 0) {
+    var launch = Logic.choiceLaunch(bin, newTrace("choice"), button ? button.args : null)
+    if (!launch) {
       // A click that runs nothing says why (a sequence's args once did, silently).
       var why = Logic.choiceRefusal(bin, button ? button.args : null)
       var data = { id: String(button && button.id || ""), why: why }
-      if (bin) Quickshell.execDetached([bin, "--trace", newTrace("choice"), "log-event", "ui", "ui.choice.refused",
-                                        "--level", "warn", "--data", JSON.stringify(data)])
+      if (bin) Quickshell.execDetached(Logic.logEventLaunch(bin, newTrace("choice"), "ui", "ui.choice.refused", data,
+                                                            "warn"))
       else console.warn("[omaanime] ui.choice.refused " + JSON.stringify(data))
       return ""
     }
-    var trace = argv[2]
+    var trace = launch.command[2]
     logEvent(trace, "ui.choice", { id: String(button.id || ""), args: button.args,
                                    playTrace: playEntry ? String(playEntry.trace || "") : null })
     if (button.ack) {
       // "Tell me when it's ready": its answer is read (`laterProc`), so the viewer is told what `later` decided.
       if (laterProc.running) return ""
       laterProc.trace = trace
-      laterProc.command = argv
+      laterProc.environment = launch.environment
+      laterProc.command = launch.command
       laterProc.running = true
       return trace
     }
-    Quickshell.execDetached(argv)
+    Quickshell.execDetached(launch)
     if (String(button.id) === "dub" || String(button.id) === "wait") expectPlayer("choice")
     settle.restart()
     return trace
@@ -1128,10 +1129,10 @@ Item {
     releasesProc.forEpisode = req.episode
     logEvent(trace, "ui.picker.load", { mediaId: req.mediaId, episode: req.episode, refresh: req.refresh,
                                         query: req.query || null, queued: !!req.trace })
-    var argv = [bin, "--trace", trace, "releases", String(req.mediaId), String(req.episode)]
-    if (req.query) argv = argv.concat(["--query", req.query])
-    else if (req.refresh) argv.push("--refresh")
-    releasesProc.command = argv
+    var words = [req.mediaId, req.episode]
+    if (req.query) words = words.concat(["--query", req.query])
+    else if (req.refresh) words.push("--refresh")
+    Logic.cliOn(releasesProc, [bin, "--trace", trace, "releases"], words)
     releasesProc.running = true
   }
 
@@ -1568,8 +1569,8 @@ Item {
             root.playEpisode = Number(s.play.episode)
             root.pickerWanted(root.playMediaId, root.playEpisode)
             if (root.running)
-              Quickshell.execDetached([root.bin, "--trace", pn.trace, "picker-notice",
-                                       String(root.playMediaId), String(root.playEpisode)])
+              Quickshell.execDetached(Logic.cliLaunch([root.bin, "--trace", pn.trace, "picker-notice"],
+                                                      [root.playMediaId, root.playEpisode]))
           }
         }
         // While our own Process runs it owns the line: its error carries the candidate list.
@@ -1787,8 +1788,8 @@ Item {
             root.pickerWanted(root.playMediaId, root.playEpisode)
             // The viewer is in the player, not the overlay; tell them there and lend them `p`.
             if (root.playIsAutoNext)
-              Quickshell.execDetached([root.bin, "--trace", root.lastErrorTrace, "picker-notice",
-                                       String(root.playMediaId), String(root.playEpisode)])
+              Quickshell.execDetached(Logic.cliLaunch([root.bin, "--trace", root.lastErrorTrace, "picker-notice"],
+                                                      [root.playMediaId, root.playEpisode]))
           }
         } else if (r && r.held === true) {
           // The wait ended without the episode: the choices are held, not failed. The entry comes with the answer, so
@@ -1835,12 +1836,11 @@ Item {
   // ever slips through, Python's watched rule is idempotent and the duplicate costs a file write.
   function tickAt(pos, dur, atEof, source) {
     if (!bin || tickProc.running || !nowPlaying || !(Number(nowPlaying.mediaId) > 0)) return false
-    var args = [bin, "--trace", String(nowPlaying.trace || lastTrace || "service"), "tick",
-                String(nowPlaying.mediaId), String(nowPlaying.episode),
-                String(Number(pos).toFixed(3)), String(Number(dur).toFixed(3)),
-                "--source", String(source || "socket")]
-    if (atEof) args.push("--eof")
-    tickProc.command = args
+    var trace = String(nowPlaying.trace || lastTrace || "service")
+    var words = [nowPlaying.mediaId, nowPlaying.episode, Number(pos).toFixed(3), Number(dur).toFixed(3),
+                 "--source", source || "socket"]
+    if (atEof) words.push("--eof")
+    Logic.cliOn(tickProc, [bin, "--trace", trace, "tick"], words)
     tickProc.running = true
     return true
   }
