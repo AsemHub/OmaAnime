@@ -114,8 +114,11 @@ Item {
   // (`Logic.playNotice`'s `held`); "" otherwise. The choices themselves are on `playEntry.choice`.
   property string playHeld: ""
   // "Tell me when it's ready" recorded for the shared entry's episode: its acknowledgement, for the popout
-  // (`Logic.playNotice`'s `later`); "" otherwise.
+  // (`Logic.playNotice`'s `later`, the watcher's progress line once it reads TorBox, then its tell); "" otherwise.
   property string playLater: ""
+  // The watcher told about that entry's episode (`Logic.laterTold`): `{ready, trace, action}`, the popout's Play
+  // (the notification's own click) and Dismiss; null otherwise.
+  property var playLaterTold: null
   // What `later` answered for the last "Tell me when it's ready" this Service ran (`Logic.laterAnswer`, with the
   // click's trace), so Browse says that, not its own guess; null before any.
   property var laterAnswer: null
@@ -153,9 +156,8 @@ Item {
   property bool pickerLoading: false
   property string pickerError: ""
   signal pickerWanted(int mediaId, int episode)
-  // Set by auto-next just before its play, so a refusal there is told to the player.
+  // Set by auto-next just before its play, so a play refused meanwhile says it came from auto-next (`play.refused`).
   property bool pendingAutoNext: false
-  property bool playIsAutoNext: false
   property string lastErrorHeadline: ""
   property string lastErrorAction: ""
   property string lastErrorHint: ""
@@ -1006,7 +1008,6 @@ Item {
     lastTrace = trace
     if (lastAdvance && Number(lastAdvance.episode) !== Number(episode)) lastAdvance = null
     clearError()
-    playIsAutoNext = pendingAutoNext
     pendingAutoNext = false
     playMediaId = Number(mediaId)
     playEpisode = Number(episode)
@@ -1027,6 +1028,66 @@ Item {
   // player's key runs. Detached, like a play from the player's own episode list: "Watch the dub now" claims over the
   // waiting play (which may be this Service's own `playProc`; it then exits with `superseded`, not an error) and is
   // narrated through `status.play` like any play started elsewhere. Returns the click's trace, or "".
+  // The told "Tell me when it's ready" line's action: the notification's own click (`notify-click`, its token in the
+  // variable; the word stays on the command line, where `playstate.pid_is_play` reads a click's play). On its own
+  // Process, not detached, so a click that cannot run (its token's file pruned) is said in the popout
+  // (`Logic.laterClickFailure`); like Browse's Play on `playProc`, a shell restart while it starts the play stops it.
+  // The play it starts claims over the entry, so the line goes. Returns the click's trace, or "".
+  function runLaterAction() {
+    var told = playLaterTold
+    // A second click while the first starts: `running` turns true only once the process has started (the probe saw
+    // the second launch replace the first), so the click's own moment guards too.
+    if (!bin || !told || !told.action || laterPlayProc.running || Date.now() - laterPlayProc.clickedAt < 3000)
+      return ""
+    var trace = newTrace("later-play")
+    laterPlayProc.clickedAt = Date.now()
+    logEvent(trace, "ui.later.play", { playTrace: told.trace, ready: told.ready })
+    laterPlayProc.trace = trace
+    laterPlayProc.answer = null
+    laterPlayProc.exit = null
+    Logic.cliOn(laterPlayProc, [bin, "--trace", trace, "notify-click"], [told.action.token])
+    laterPlayProc.running = true
+    expectPlayer("later")
+    settle.restart()
+    return trace
+  }
+
+  // The told line's Play has ended: its answer and its exit, in either order (the qs probe saw the stream end first
+  // in 30 of 30 runs, but Quickshell does not promise it; see Browse's `searchProc`). A click a new play's claim
+  // killed (SIGTERM, status 1) printed nothing and is no failure (`Logic.laterClickFailure`).
+  function laterPlayEnded() {
+    var p = laterPlayProc
+    if (p.answer === null || p.exit === null) return
+    var failed = Logic.laterClickFailure(p.answer, p.trace, p.exit.status)
+    logEvent(p.trace, "ui.later.playEnded", { code: p.exit.code, status: p.exit.status,
+                                              failedStage: failed ? failed.stage : null,
+                                              error: failed ? failed.error : null })
+    p.answer = null
+    p.exit = null
+    if (!failed) return
+    clearError()
+    lastError = failed.error
+    lastErrorStage = failed.stage
+    lastErrorSuggest = failed.suggest
+    lastErrorTrace = failed.trace
+    lastErrorHeadline = failed.headline
+    lastErrorAction = failed.action
+    refresh()
+  }
+
+  // Dismiss on the told line: the entry is marked (`later-dismiss`, trace-checked under the claim lock), so no
+  // surface shows it again; hidden here at once.
+  function dismissLater() {
+    var told = playLaterTold
+    if (!bin || !told) return ""
+    var trace = newTrace("later-dismiss")
+    Quickshell.execDetached(Logic.cliLaunch([bin, "--trace", trace, "later-dismiss"], [told.trace]))
+    playLater = ""
+    playLaterTold = null
+    settle.restart()
+    return trace
+  }
+
   function runChoice(button) {
     var launch = Logic.choiceLaunch(bin, newTrace("choice"), button ? button.args : null)
     if (!launch) {
@@ -1058,11 +1119,69 @@ Item {
 
   // The release picker's list. A search under 30 minutes old comes back from the CLI's
   // own store without touching an index; `refresh` (the picker's `r`) searches again.
-  // The overlay, straight onto the release picker for one episode (popout button, IPC, mpv's p).
-  function summonPicker(mediaId, episode) {
+  // The overlay, straight onto the release picker for one episode (popout button, IPC, mpv's p). `trace` is the press's
+  // own when `p` asked (`refusedPicker`), and `playTrace` the refused play's, so one trace runs from the press to here.
+  function summonPicker(mediaId, episode, trace, playTrace) {
     if (!shell || typeof shell.summon !== "function") return false
-    logEvent(newTrace("picker-summon"), "ui.picker.summon", { mediaId: mediaId, episode: episode })
+    var data = { mediaId: mediaId, episode: episode }
+    if (playTrace) data.playTrace = String(playTrace)
+    logEvent(trace || newTrace("picker-summon"), "ui.picker.summon", data)
     return shell.summon(pluginId, JSON.stringify({ picker: { mediaId: Number(mediaId), episode: Number(episode) } })) !== false
+  }
+
+  // mpv's lent `p` runs `omarchy-shell omaanime refusedPicker`, with no word of the show on its command line (a
+  // command line is readable by every account). The episode is read now from `status`, not from the poll's copy (up
+  // to 10 s old): the picker opens on the play's entry only when that is a refusal that lent `p`
+  // (`Logic.refusedPickerDecision`), else one SKIP line. Its stdout's end and its exit come in no guaranteed order (as
+  // `releases`'), so the press is decided once both have been seen.
+  function openRefusedPicker() {
+    if (!bin) return false
+    if (refusedPickerProc.running) {
+      logEvent(refusedPickerProc.trace, "ui.picker.refused",
+               { result: "SKIP", reason: "a press is already reading status",
+                 suggest: "the picker opens from the press before, if that refusal lent p" })
+      return true
+    }
+    refusedPickerProc.trace = newTrace("picker-summon")
+    refusedPickerProc.out = ""
+    refusedPickerProc.code = null
+    refusedPickerProc.streamDone = false
+    refusedPickerProc.command = [bin, "--trace", refusedPickerProc.trace, "status"]
+    refusedPickerProc.running = true
+    return true
+  }
+
+  function refusedPickerDecide() {
+    if (!refusedPickerProc.streamDone || refusedPickerProc.code === null) return
+    var d = Logic.refusedPickerDecision(refusedPickerProc.out, refusedPickerProc.code)
+    refusedPickerProc.streamDone = false
+    refusedPickerProc.code = null
+    if (d.action === "summon") {
+      root.summonPicker(d.mediaId, d.episode, refusedPickerProc.trace, d.playTrace)
+      return
+    }
+    root.logEvent(refusedPickerProc.trace, "ui.picker.refused",
+                  { result: "SKIP", reason: d.reason, suggest: d.suggest, playTrace: d.playTrace, state: d.state,
+                    mediaId: d.mediaId, episode: d.episode })
+  }
+
+  Process {
+    id: refusedPickerProc
+    property string trace: ""
+    property string out: ""
+    property var code: null
+    property bool streamDone: false
+    stdout: StdioCollector {
+      onStreamFinished: {
+        refusedPickerProc.out = this.text
+        refusedPickerProc.streamDone = true
+        root.refusedPickerDecide()
+      }
+    }
+    onExited: function (code) {
+      refusedPickerProc.code = code
+      root.refusedPickerDecide()
+    }
   }
 
   // A request made while a `releases` run was in flight used to be dropped: the sheet for the new
@@ -1544,6 +1663,7 @@ Item {
         if (!playProc.running) {
           root.playHeld = pn.held
           root.playLater = pn.later
+          root.playLaterTold = pn.laterTold
         }
         if (pn.adopt) {
           root.playSeenTrace = pn.trace
@@ -1561,16 +1681,13 @@ Item {
                                            episode: s.play ? s.play.episode : null,
                                            startedHere: false }, "warn")
           // A play this Service did not start — the player's own episode list runs
-          // `omarchy-anime play` itself — refuses the same way, so it hands over the same way:
-          // the picker, and, since the viewer is in the player, the notice and a borrowed `p`.
+          // `omarchy-anime play` itself — refuses the same way, so it hands over the same way: the picker. The player's
+          // `p` was lent by the play itself (`cli.lend_picker_key`), as for every play.
           root.lastErrorPicker = Logic.wantsPicker({ ok: false, stage: pn.stage })
           if (root.lastErrorPicker && s.play && Number(s.play.mediaId) > 0 && Number(s.play.episode) > 0) {
             root.playMediaId = Number(s.play.mediaId)
             root.playEpisode = Number(s.play.episode)
             root.pickerWanted(root.playMediaId, root.playEpisode)
-            if (root.running)
-              Quickshell.execDetached(Logic.cliLaunch([root.bin, "--trace", pn.trace, "picker-notice"],
-                                                      [root.playMediaId, root.playEpisode]))
           }
         }
         // While our own Process runs it owns the line: its error carries the candidate list.
@@ -1724,6 +1841,26 @@ Item {
     }
   }
 
+  // The told line's Play (`runLaterAction`). Its answer is said only when the click itself could not run; a play it
+  // started is the poll's to narrate. Read once both its stdout and its exit are in (`laterPlayEnded`).
+  Process {
+    id: laterPlayProc
+    property string trace: ""
+    property real clickedAt: 0
+    property var answer: null          // stdout's text, once its stream ended
+    property var exit: null            // `{code, status}`, once it exited
+    stdout: StdioCollector {
+      onStreamFinished: {
+        laterPlayProc.answer = this.text
+        root.laterPlayEnded()
+      }
+    }
+    onExited: function (code, status) {
+      laterPlayProc.exit = { code: code, status: status }
+      root.laterPlayEnded()
+    }
+  }
+
   Process {
     id: laterProc
     property string trace: ""
@@ -1745,6 +1882,7 @@ Item {
         root.playRefusal = ""
         root.playHeld = ""
         root.playLater = ""
+        root.playLaterTold = null
         // Cleared up front so a play this Service spawned itself, which never
         // goes through `Logic.playNotice`, cannot leave a *stale* sentence on screen from whatever
         // failed before it — every branch below either leaves this cleared or fully overwrites it.
@@ -1782,15 +1920,11 @@ Item {
           root.lastErrorHint = said.hint
           // The same failure is in the shared entry; this one is richer, so mark it seen.
           root.playSeenTrace = root.lastErrorTrace
-          // A refusal, or every release failing, hands over to the picker.
+          // A refusal, or every release failing, hands over to the picker. In the player, the play lent `p` itself
+          // (`cli.lend_picker_key`), whatever started it: Browse, the bar or auto-next.
           root.lastErrorPicker = Logic.wantsPicker(r)
-          if (root.lastErrorPicker && root.playMediaId > 0) {
+          if (root.lastErrorPicker && root.playMediaId > 0)
             root.pickerWanted(root.playMediaId, root.playEpisode)
-            // The viewer is in the player, not the overlay; tell them there and lend them `p`.
-            if (root.playIsAutoNext)
-              Quickshell.execDetached(Logic.cliLaunch([root.bin, "--trace", root.lastErrorTrace, "picker-notice"],
-                                                      [root.playMediaId, root.playEpisode]))
-          }
         } else if (r && r.held === true) {
           // The wait ended without the episode: the choices are held, not failed. The entry comes with the answer, so
           // Browse shows the buttons now rather than at the next poll.
@@ -1799,7 +1933,9 @@ Item {
           root.logEvent(root.lastTrace, "play.held", { episode: r.episode || null, trace: String(r.trace || "") })
         } else if (r && r.later === true) {
           // "Tell me when it's ready" ended this Service's own waiting play: the popout says it was heard.
-          root.playLater = Logic.playNotice(r.play, false, "", Date.now() / 1000).later
+          var told = Logic.playNotice(r.play, false, "", Date.now() / 1000)
+          root.playLater = told.later
+          root.playLaterTold = told.laterTold
         } else if (r && r.refused === "not_out") {
           // AniList lists the entry as not yet released: refused before anything started (no claim, no player, no
           // search). Said as a refusal, not an error; Browse stays open on it.
@@ -2064,7 +2200,8 @@ Item {
       return root.shell.summon(root.pluginId, payload) === false ? "could not open the overlay" : "ok"
     }
     // `omarchy-shell omaanime picker <mediaId> <episode>` opens the overlay on the release
-    // picker. mpv's borrowed `p` runs it; a keybind can too.
+    // picker; a keybind can run it. mpv's borrowed `p` runs `refusedPicker`, which names no show.
+    function refusedPicker(): string { return root.openRefusedPicker() ? "ok" : "no CLI" }
     function picker(mediaId: string, episode: string): string {
       var m = parseInt(mediaId, 10), e = parseInt(episode, 10)
       if (!(m > 0) || !(e > 0)) return "usage: picker <anilistMediaId> <episode>"

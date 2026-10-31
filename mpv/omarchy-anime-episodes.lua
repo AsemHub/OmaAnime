@@ -499,6 +499,12 @@ local function status_line()
         if play_entry.failedStage == "indexers.none" and type(said.hint) == "string" and said.hint ~= "" then
             text = text .. " " .. said.hint
         end
+        -- A refusal that lent `p` to the picker (`cli.lend_picker_key`) names the key, once (a suggest may already).
+        -- Only while nothing is watched: over an episode being watched `p` stays what it was (`picker-key`).
+        if type(play_entry.detail) == "table" and play_entry.detail.picker == true and nothing_watched()
+           and not text:lower():find("press p", 1, true) then
+            text = text .. " \194\183 Press p to choose a release."
+        end
         return text, "&H5050FF&"      -- ASS is &HBBGGRR&: red
     end
     return "", "&HFFFFFF&"
@@ -1922,6 +1928,50 @@ end)
 
 mp.register_script_message("toggle", toggle)
 
+-- `p`, lent by a refused play (`player.arm_picker_key`): its binding sends `picker-key` with what `p` did before the
+-- borrow. The press decides, here, where what is watched is known: the picker only while nothing is watched and the
+-- entry is still the refusal that lent `p` (the Service checks that entry again); over an episode being watched (a
+-- paused one in a hidden window, an ended one sought back) `p` does what it did. `mp.command` runs that command as
+-- input.conf would, OSD included (man mpv 0.41). The Service's IPC target is `omaanime` (Service.qml's IpcHandler).
+mp.register_script_message("picker-key", function(restore)
+    poll_play_status()       -- the entry as it is now, not as the last tick read it
+    local e = play_entry
+    local lent = type(e) == "table" and e.state == "failed" and type(e.detail) == "table" and e.detail.picker == true
+    local watched = not nothing_watched()
+    local opens = lent and not watched
+    local saved = (type(restore) == "string" and restore ~= "") and restore or "ignore"
+    local reason = opens and "the refused play lent p and nothing is watched"
+                   or (lent and "an episode is being watched: p does what it did"
+                       or "the entry is not a refusal that lent p: p does what it did")
+    local spawn = nil
+    if opens then
+        local res = mp.command_native(cli_command({ detach = true,
+                                                    head = { "omarchy-shell", "omaanime", "refusedPicker" } }))
+        spawn = res and res.status
+    else
+        mp.command(saved)
+    end
+    -- The press is logged under the refused play's trace (the Service's `ui.picker.summon` names it too).
+    local trace = type(e) == "table" and tostring(e.trace or "") or ""
+    if trace == "" then trace = string.format("mpv-picker-%d", os.time()) end
+    msg.info("picker-key " .. (opens and "picker" or "restore") .. " trace=" .. trace .. ": " .. reason)
+    if opens and spawn ~= 0 then
+        mp.osd_message("The release picker could not be opened; the popout's Choose a release opens it", 4)
+    end
+    if opts.bin == "" then return end
+    local data = { decided = opens and "picker" or "restore", reason = reason, restores = saved, lent = lent,
+                   watched = watched, state = type(e) == "table" and e.state or nil,
+                   mediaId = type(e) == "table" and e.mediaId or nil, episode = type(e) == "table" and e.episode or nil,
+                   spawn = spawn }
+    local json = utils.format_json(data)
+    if not json then return end
+    mp.command_native_async(cli_command({
+        detach = true,
+        head = { opts.bin, "--trace", trace, "log-event" },
+        words = { "player.picker_key", "press", "--result", opens and "PASS" or "SKIP", "--data", json },
+    }), function() end)
+end)
+
 -- Introspection for the verification pass: the panel's state without a screenshot. Writing it into
 -- `user-data` rather than a file keeps it readable over the same IPC socket everything else uses.
 mp.register_script_message("dump", function()
@@ -2104,6 +2154,8 @@ status_timer = mp.add_periodic_timer(POLL_IDLE_S, tick_status)
 -- The guard `Mpv.ensure_script` reads: `scripts` only reflects --script= arguments, so it cannot
 -- say whether this file was loaded over IPC.
 mp.set_property_native("user-data/omarchy-anime/episodes", true)
+-- `player.arm_picker_key` lends `p` only to a player whose script handles `picker-key`: this one, not an older copy.
+mp.set_property_native("user-data/omarchy-anime/picker-key", true)
 msg.info("loaded as " .. mp.get_script_name() .. ", bin=" .. (opts.bin ~= "" and opts.bin or "<unset>")
          .. ", font=" .. (opts.font ~= "" and opts.font or "osd-font")
          .. ", arabic_font=" .. (arabic_font ~= "" and arabic_font or "none") .. " (" .. arabic_why .. ")")

@@ -311,22 +311,93 @@ function errorSentences(say, fallbackError, fallbackSuggest) {
 // failed: `held` is its plain sentence (the CLI's rendering), which the popout shows dimmed and without "Copy trace",
 // and Browse shows above the choices' buttons. Its process has exited, so no Process of this Service is running it.
 // `later` is a play the viewer asked to be told about ("Tell me when it's ready"): its acknowledgement, "We'll tell you
-// when episode 3 is ready.", for the popout. Both belong to their moment: `HELD_SHOW_S` after `finishedAt` they are
-// gone (the number is `playstate.HELD_SHOW_S`).
+// when episode 3 is ready.", for the popout, then the watcher's news on it. Both belong to their moment: a held play
+// `HELD_SHOW_S` after `finishedAt` (the number is `playstate.HELD_SHOW_S`); a later one as `laterShownUntil` says.
 var HELD_SHOW_S = 3600
+// The watcher of pending downloads writes its news on the `later` entry (`playstate.later_update`): each poll's line
+// ("Downloading episode 1 on TorBox: 71 %") with `watch.at`, so a wait it still follows is current for `HELD_SHOW_S`
+// after its newest reading; then the tell (`told`: ready or gave up, the notification's body as `message`, and its
+// click's action), current for `TOLD_SHOW_S` after the tell (`playstate.TOLD_SHOW_S`) unless the viewer dismissed it
+// (`dismissedAt`). A new play's claim replaces the entry, so a played episode's line goes with it.
+var TOLD_SHOW_S = 86400
+var CLICK_TOKEN = /^[0-9a-f]{32}$/
+
+// The told line's buttons, or null: `{ready, trace, action: {label, token} | null}`. The action is the
+// notification's own click (its token, `notify-click`); none when the notification carried none.
+function laterTold(play) {
+  var told = play && play.state === "later" && play.told && typeof play.told === "object" ? play.told : null
+  if (!told) return null
+  var a = told.action && typeof told.action === "object" ? told.action : null
+  var token = a ? String(a.token || "") : ""
+  return { ready: told.ready === true, trace: String(play.trace || ""),
+           action: a && CLICK_TOKEN.test(token) ? { label: String(a.label || "Play"), token: token } : null }
+}
+
+// The answer of the told line's Play (`notify-click`, run on the Service's own Process) when it must be said in the
+// popout: the click could not run (`notify.clicked`'s FAIL, stage `notify.click`: its token's file was pruned or is
+// unreadable), or it gave no JSON and was not killed by a signal. null otherwise: once the click's play claims, the
+// status poll narrates it as any play started elsewhere, its failure included, so saying it here too would say it
+// twice. `status` is the Process's exit status: 1 (CrashExit) is a signal. A new play's claim SIGTERMs the click's
+// play during its search or load (`playstate.stop_play`), and it dies printing nothing; that new play is the poll's.
+// A Quickshell 0.3.2 probe gave status 1 (code 15) for a SIGTERM'd child, and status 0 (code 1) for a silent exit and
+// for a traceback, so a click that crashes before printing is still said.
+// `{error, stage, suggest, trace, headline, action}` in the popout's error fields.
+function laterClickFailure(text, trace, status) {
+  var r
+  try {
+    r = JSON.parse(String(text || ""))
+  } catch (e) {
+    if (status === 1) return null
+    return { error: "notify-click returned no JSON", stage: "cli", suggest: "run: omarchy-anime trace " + trace,
+             trace: String(trace || ""), headline: "The Play button gave no answer.",
+             action: "Play the episode from Browse." }
+  }
+  if (!r || typeof r !== "object" || r.ok !== false || r.stage !== "notify.click") return null
+  return { error: String(r.error || "the click could not run"), stage: "notify.click",
+           suggest: String(r.suggest || ""), trace: String(r.trace || trace || ""),
+           headline: "This Play is no longer available: the notification's click was cleared.",
+           action: "Play the episode from Browse." }
+}
+
+// When a held or later entry stops being shown: `HELD_SHOW_S` after it ended (a followed wait: after its newest
+// reading), `TOLD_SHOW_S` after a tell; 0 for a dismissed tell (shown no more).
+function laterShownUntil(play) {
+  var told = laterTold(play)
+  if (told) return play.dismissedAt ? 0 : (Number(play.told.at) || 0) + TOLD_SHOW_S
+  var at = Number(play.finishedAt) || 0
+  if (play.state === "later" && play.watch && typeof play.watch === "object")
+    at = Math.max(at, Number(play.watch.at) || 0)
+  return at + HELD_SHOW_S
+}
+
+// Which line the popout's status line shows, the most pressing first: the play's progress rows hide it (""), then
+// "service" (no Service), "error", "notice" (a standing one: a sign-in expired, AniList's budget), "busy", "held",
+// "later", and "idle" ("Nothing playing" / "Player not running", shown only while no episode is loaded; "" then).
+// `rows` is the progress rows' count, `loaded` whether an episode is loaded, `s` the Service's `{lastError, notice,
+// busy, held, later}` or null. Panel.qml's Text and the told line's buttons both read it: the buttons are the `later`
+// line's, so they show only when it is the line shown.
+function statusLineKind(rows, loaded, s) {
+  if (Number(rows) > 0) return ""
+  if (!s || typeof s !== "object") return "service"
+  var kind = s.lastError ? "error" : s.notice ? "notice" : s.busy ? "busy" : s.held ? "held" : s.later ? "later"
+             : "idle"
+  return kind === "idle" && loaded ? "" : kind
+}
 
 function playNotice(play, mine, seenTrace, nowSec) {
   var out = { busy: "", error: "", stage: "", suggest: "", trace: "", adopt: false,
-              headline: "", action: "", hint: "", held: "", later: "" }
+              headline: "", action: "", hint: "", held: "", later: "", laterTold: null }
   if (!play || typeof play !== "object" || !play.state) return out
   if (mine === true) return out
   out.trace = String(play.trace || "")
   if (play.state === "held" || play.state === "later") {
     var at = Number(nowSec)
     if (!isFinite(at) || at <= 0) at = Date.now() / 1000
-    if (at - (Number(play.finishedAt) || 0) > HELD_SHOW_S) return out
-    if (play.state === "later") out.later = String(play.message || "")
-    else out.held = play.text ? String(play.text) : "Episode " + play.episode + " — " + String(play.message || "")
+    if (at > laterShownUntil(play)) return out
+    if (play.state === "later") {
+      out.later = String(play.message || "")
+      out.laterTold = laterTold(play)
+    } else out.held = play.text ? String(play.text) : "Episode " + play.episode + " — " + String(play.message || "")
     return out
   }
   if (play.state === "running") {
@@ -583,6 +654,61 @@ function pickerErrorText(r) {
 function wantsPicker(r) {
   if (!r || typeof r !== "object" || r.ok !== false) return false
   return PICKER_STAGES.indexOf(String(r.stage || "")) >= 0
+}
+
+// mpv's lent `p` (`refusedPicker`, no word of the show on its command line): the episode the picker opens on, from the
+// play's entry as `status` reads it at the press. Only a failed play whose entry says it lent `p` (`detail.picker`,
+// `cli.lend_picker_key`); anything else is a key pressed after another play took over, and opens nothing.
+// `{mediaId, episode, reason}`, the ids 0 when nothing opens.
+function refusedPickerTarget(play) {
+  function none(why) { return { mediaId: 0, episode: 0, reason: why } }
+  if (!play || typeof play !== "object") return none("no play entry")
+  if (play.state !== "failed") return none("the play's entry is " + String(play.state || "unknown") + ", not a refusal")
+  if (!play.detail || play.detail.picker !== true) return none("that refusal did not lend p")
+  var m = Number(play.mediaId), e = Number(play.episode)
+  if (!(m > 0) || !(e > 0)) return none("the entry names no episode")
+  return { mediaId: m, episode: e, reason: "the refused play lent p" }
+}
+
+// What the lent `p`'s press does, from the `status` run it made (`refusedPicker`): its whole stdout and its exit code,
+// both seen. `{action, mediaId, episode, playTrace, state, reason, suggest}`: "summon" opens the picker on the refused
+// play (`refusedPickerTarget`); "skip" opens nothing and is logged. A `status` that crashed, exited non-zero, printed
+// nothing or printed no JSON is told apart from an entry that is not a refusal: the first is the CLI's own failure.
+function refusedPickerDecision(text, exitCode) {
+  var out = { action: "skip", mediaId: 0, episode: 0, playTrace: "", state: null, reason: "", suggest: "" }
+  function broken(why) {
+    out.reason = why
+    out.suggest = "run `omarchy-anime status` in a terminal: it says why"
+    return out
+  }
+  var code = Number(exitCode)
+  if (exitCode !== undefined && exitCode !== null && code !== 0) return broken("status exited " + exitCode)
+  var raw = String(text === undefined || text === null ? "" : text).trim()
+  if (raw === "") return broken("status printed nothing")
+  var s = null
+  try {
+    s = JSON.parse(raw)
+  } catch (e) {
+    return broken("status printed no JSON")
+  }
+  if (!s || typeof s !== "object" || isList(s)) return broken("status printed no JSON object")
+  var play = s.play && typeof s.play === "object" ? s.play : null
+  if (play) {
+    out.playTrace = String(play.trace || "")
+    out.state = play.state ? String(play.state) : null
+    out.mediaId = Number(play.mediaId) || 0
+    out.episode = Number(play.episode) || 0
+  }
+  var at = refusedPickerTarget(play)
+  out.reason = at.reason
+  if (at.mediaId > 0) {
+    out.action = "summon"
+    out.mediaId = at.mediaId
+    out.episode = at.episode
+    return out
+  }
+  out.suggest = "the popout's Choose a release opens the picker"
+  return out
 }
 
 // The release list's requests, the newest winning. One Process runs `releases`; its exit and the

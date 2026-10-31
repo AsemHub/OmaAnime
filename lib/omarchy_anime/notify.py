@@ -258,9 +258,11 @@ def do_not_disturb() -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-def ready_sound(log: Log, parent: str = "") -> dict:
+def ready_sound(log: Log, parent: str = "", *,
+                played_reason: str = "the episode is ready and loaded paused; the viewer may have looked away") -> dict:
     """Play the ready sound once, detached (nothing waits for it): `{played, player, file, pid, dnd, reason}`, one
-    `notify sound` line. Not played with do-not-disturb on, without a sound file, or without a player."""
+    `notify sound` line, whose PASS `reason` is the caller's `played_reason` (a play's paused episode by default; the
+    watcher's tell names its own). Not played with do-not-disturb on, without a sound file, or without a player."""
     t0 = time.monotonic()
     dnd = do_not_disturb()
     path = next((f for f in SOUND_FILES if Path(f).is_file()), None)
@@ -277,7 +279,7 @@ def ready_sound(log: Log, parent: str = "") -> dict:
         try:
             pid = _spawn_sound(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                start_new_session=True, close_fds=True).pid
-            reason = "the episode is ready and loaded paused; the viewer may have looked away"
+            reason = played_reason
         except OSError as exc:
             reason = f"the player could not be started: {type(exc).__name__}: {exc}"
     played = pid is not None

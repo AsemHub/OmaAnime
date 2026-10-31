@@ -587,6 +587,92 @@ def _imdb(value) -> str | None:
     return v if re.fullmatch(r"tt\d{5,10}", v) else None
 
 
+def _imdb_number(value) -> int | None:
+    """An IMDb id as its number: `tt0400201` (ani.zip, Subdl) and 400201 (OpenSubtitles) are one id; "", 0 and junk
+    are none (Subdl sends `imdb_id: ""` for a show it has no IMDb id for)."""
+    if isinstance(value, bool):
+        return None
+    m = re.fullmatch(r"(?:tt)?(\d{1,10})", str(value or "").strip())
+    if not m:
+        return None
+    return int(m.group(1)) or None
+
+
+# ----------------------------------------------------------------------------- the show a title-step record names
+#
+# A title search matches words, not shows: the title step for a one-episode entry answered three
+# live-action series whose file names all pass `name_check`, and the first was selected. A title-step record that
+# names its show's ids is compared with the entry's (`show_tie`); one that names none is never selected for the viewer.
+
+def os_show_ids(rec: dict) -> dict:
+    """The show an OpenSubtitles record is filed under, from `attributes.feature_details`: an episode's
+    `parent_imdb_id`, `parent_tmdb_id` and `parent_title` (its own `imdb_id`/`tmdb_id` are the episode's), any other
+    feature's (a movie, a show) own `imdb_id`, `tmdb_id` and `title`."""
+    fd = ((rec or {}).get("attributes") or {}).get("feature_details") or {}
+    pre = "parent_" if str(fd.get("feature_type") or "").lower() == "episode" else ""
+    return {"imdb": _imdb_number(fd.get(f"{pre}imdb_id")), "tmdb": _pos_int(fd.get(f"{pre}tmdb_id")),
+            "title": fd.get(f"{pre}title"), "type": fd.get("feature_type")}
+
+
+def subdl_show_ids(results) -> dict:
+    """The show a Subdl answer is for: its `results[]` when that names exactly one show (every recorded title answer
+    names one or none), else no ids, since no file can be tied to one of several."""
+    shows = [r for r in results or [] if isinstance(r, dict)]
+    if len(shows) != 1:
+        return {"imdb": None, "tmdb": None, "title": None, "type": None, "shows": len(shows)}
+    s = shows[0]
+    return {"imdb": _imdb_number(s.get("imdb_id")), "tmdb": _pos_int(s.get("tmdb_id")), "title": s.get("name"),
+            "type": s.get("type"), "shows": 1}
+
+
+def show_tie(plan: dict, ids: dict) -> tuple[str, str]:
+    """Is this title-step record's show the entry? `("imdb"|"tmdb", why)`: tied by that id; `("other", why)`: another
+    show, dropped; `("none", why)`: nothing ties it, so it may be offered but is never selected.
+
+    IMDb decides when both sides have one. A different IMDb id is another show, except for a sequel: ani.zip gives
+    some sequels their franchise's id (a `Hatepororogatari Second Season` entry carries the `Pororogatari` id while
+    OpenSubtitles files its episodes under the sequel's own), so a sequel's is only not tied. TMDB ties but never
+    drops: measured, ani.zip's TMDB id for one show was not OpenSubtitles' while their IMDb ids agreed. TMDB numbers
+    are per type (a movie and a show may share one), so they tie only when the record's type is the entry's."""
+    ours, theirs = _imdb_number(plan.get("imdb")), ids.get("imdb")
+    if ours and theirs:
+        if ours == theirs:
+            return "imdb", f"the record's show is tt{theirs:07d}, the entry's"
+        if plan.get("sequel"):
+            return "none", (f"the record's show is tt{theirs:07d}, the entry's tt{ours:07d}: a sequel, whose ani.zip "
+                            f"id may be the first series'")
+        return "other", f"another show's id: tt{theirs:07d} (the entry's tt{ours:07d})"
+    ours_t, theirs_t = _pos_int(plan.get("tmdb")), ids.get("tmdb")
+    if ours_t and theirs_t:
+        kind, want = _record_kind(ids.get("type")), "movie" if plan.get("movie") else "tv"
+        if kind != want:
+            word = {"movie": "movie", "tv": "show"}
+            return "none", (f"the record's TMDB {theirs_t} comes with no type, and TMDB ids are per type" if not kind
+                            else f"the record's TMDB {theirs_t} is a {word[kind]}'s, the entry is a {word[want]}: "
+                                 f"TMDB ids are per type")
+        if ours_t == theirs_t:
+            return "tmdb", f"the record's show is TMDB {theirs_t}, the entry's"
+        return "none", f"the record's show is TMDB {theirs_t}, the entry's {ours_t}; TMDB ids alone do not drop"
+    if not (ours or ours_t):
+        return "none", "the entry has no IMDb or TMDB id"
+    shows = ids.get("shows")
+    if shows is not None and shows != 1:
+        return "none", (f"the answer names {shows} shows, so no file is tied to one" if shows
+                        else "the answer names no show")
+    return "none", "the record names no show id"
+
+
+def _record_kind(feature_type) -> str | None:
+    """A record's type as "movie" or "tv", from OpenSubtitles' `Movie`, `Episode`, `Tvshow`; Subdl's `movie`, `tv`."""
+    t = str(feature_type or "").lower()
+    return "movie" if t == "movie" else "tv" if t in ("episode", "tvshow", "tv") else None
+
+
+def untied(c: dict) -> bool:
+    """A candidate nothing ties to the entry (`show_tie` "none"): offered, never selected."""
+    return c.get("show_tie") == "none"
+
+
 def checked_release_ids(mapping: dict, release_ids: dict | None, *, source: str = "indexer",
                         log: Log | None = None) -> dict:
     """The playing release's show ids when they may lead the plan, else `{}`.
@@ -763,7 +849,9 @@ class SubdlClient(_Client):
                 self.log.info("extsubs.subdl", stage, result="EMPTY", status=status,
                               error=(body or {}).get("error") if isinstance(body, dict) else None)
                 break
-            out += body.get("subtitles") or []
+            # The answer names its show once, in `results[]`; each file carries it for the title step's check.
+            show = subdl_show_ids(body.get("results"))
+            out += [{**s, "_show": show} for s in body.get("subtitles") or [] if isinstance(s, dict)]
             if page >= int(body.get("totalPages") or 1):
                 break
         return out
@@ -846,6 +934,25 @@ def _log_dropped(log: Log | None, service: str, step: str, drops: list[tuple[str
              more=max(0, len(drops) - DROPPED_NAMES_MAX))
 
 
+def _record_tie(log: Log | None, service: str, step: str, plan: dict, name: str, ids: dict) -> dict:
+    """The candidate's `show_tie`, `show_tie_why` and `show_ids` (the record's) for a title-step record whose name
+    passed, with one `extsubs.<service> show_id` line naming both sides' ids; an id step's record is "query": the
+    database was asked by the entry's own id. The candidate keeps the reason and ids, so a cached answer's play can say
+    why a file is offered without searching again."""
+    if step != "title":
+        return {"show_tie": "query", "show_tie_why": None, "show_ids": None}
+    tie, why = show_tie(plan, ids)
+    record = {k: ids.get(k) for k in ("imdb", "tmdb", "type", "shows")}
+    if log:
+        log.info(f"extsubs.{service}", "show_id", result={"other": "DROP", "none": "UNTIED"}.get(tie, "PASS"),
+                 step=step, name=_cut(name), tie=tie, record=record,
+                 record_title=_cut(str(ids.get("title") or "")) or None,
+                 entry={"imdb": _imdb_number(plan.get("imdb")), "tmdb": _pos_int(plan.get("tmdb")),
+                        "sequel": plan.get("sequel")},
+                 reason=why, suggest="offered for the viewer to choose, never selected" if tie == "none" else None)
+    return {"show_tie": tie, "show_tie_why": why, "show_ids": record}
+
+
 def subdl_candidates(records: list[dict], plan: dict, lang: str, step: str,
                      log: Log | None = None) -> tuple[list[dict], Counter]:
     """One candidate per file that fits. A pack answers with its file list (`unpack=1`); a file
@@ -881,6 +988,11 @@ def subdl_candidates(records: list[dict], plan: dict, lang: str, step: str,
                 ok, why = False, "only a pack says which episode"
             if ok and f is None and pack:
                 ok, why = False, "a pack without a file list"
+            tied = {}
+            if ok:
+                tied = _record_tie(log, "subdl", step, plan, name, rec.get("_show") or {})
+                if tied["show_tie"] == "other":
+                    ok, why = False, tied["show_tie_why"]
             if not ok:
                 dropped[why.split(":")[0].split(" [")[0]] += 1
                 names.append((name, why, release))
@@ -894,7 +1006,7 @@ def subdl_candidates(records: list[dict], plan: dict, lang: str, step: str,
                          "season": (f or {}).get("season") or rec.get("season"), "episode": file_ep,
                          "url": _subdl_file_url(url), "zip": f is None, "pack": pack, "check": why, "step": step,
                          "md5": (f or {}).get("md5") or None, "code": code,
-                         "region_rank": region_rank(lang, "subdl", code)})
+                         "region_rank": region_rank(lang, "subdl", code), **tied})
     _log_dropped(log, "subdl", step, names)
     return kept, dropped
 
@@ -922,6 +1034,11 @@ def os_candidates(records: list[dict], plan: dict, lang: str, step: str,
         name = a.get("release") or files[0].get("file_name") or ""
         ok, why = name_check(name, variants, target, True)
         _log_year(log, "opensubtitles", step, name, why)
+        tied = {}
+        if ok:
+            tied = _record_tie(log, "opensubtitles", step, plan, name, os_show_ids(rec))
+            if tied["show_tie"] == "other":
+                ok, why = False, tied["show_tie_why"]
         if not ok:
             dropped[why.split(":")[0].split(" [")[0]] += 1
             names.append((name, why, ""))
@@ -932,7 +1049,8 @@ def os_candidates(records: list[dict], plan: dict, lang: str, step: str,
                      "machine": bool(a.get("ai_translated") or a.get("machine_translated")),
                      "trusted": bool(a.get("from_trusted")), "format": "srt",
                      "season": se, "episode": ep, "url": None, "zip": False, "pack": False, "check": why,
-                     "step": step, "code": code, "region_rank": region_rank(lang, "opensubtitles", code)})
+                     "step": step, "code": code, "region_rank": region_rank(lang, "opensubtitles", code),
+                     **tied})
     _log_dropped(log, "opensubtitles", step, names)
     return kept, dropped
 
@@ -967,11 +1085,13 @@ def affinity(cand: dict, playing_title: str) -> tuple[int, list[str]]:
 
 
 def rank_key(c: dict) -> tuple:
-    """Best first: human translation (machine-translated last of all), the viewer's own variant (`region_rank`:
+    """Best first: a file tied to the entry's show (`untied` ones last of all, so the first track is one that may be
+    selected whenever any is), human translation (machine-translated last), the viewer's own variant (`region_rank`:
     its own code, the language's, another variant's), verified timing, affinity with the playing release, downloads,
     then hearing-impaired below. Last tie-break: a file whose name names the show over a bare `4.srt`."""
-    return (not c.get("machine"), -c.get("region_rank", 0), c.get("timing_verified") is True, c.get("affinity", 0),
-            c.get("downloads") or 0, not c.get("hearing_impaired"), c.get("check") != "numbering only")
+    return (not untied(c), not c.get("machine"), -c.get("region_rank", 0), c.get("timing_verified") is True,
+            c.get("affinity", 0), c.get("downloads") or 0, not c.get("hearing_impaired"),
+            c.get("check") != "numbering only")
 
 
 def rank(cands: list[dict], playing_title: str = "") -> list[dict]:
@@ -1123,7 +1243,8 @@ def search(http: Http, log: Log, plan: dict, lang: str, *, playing_title: str = 
                           for s, r in reports.items()},
              top=[{"service": c["service"], "name": c["name"], "affinity": c["affinity"], "code": c.get("code"),
                    "region_rank": c.get("region_rank"),
-                   "downloads": c["downloads"], "check": c.get("check")} for c in ranked[:TOP_N]])
+                   "downloads": c["downloads"], "check": c.get("check"), "show_tie": c.get("show_tie")}
+                  for c in ranked[:TOP_N]])
     return {"candidates": ranked, "services": reports, "lang": lang}
 
 
@@ -1416,16 +1537,30 @@ def usable_reference(log: Log, reference: list[float] | None, file_cues: list[in
     return reference
 
 
+def _title_step_ties(cands) -> list[dict]:
+    """Each title-step candidate's tie as the cache keeps it (name, tie, reason, the record's ids), for a log line."""
+    return [{"name": _cut(str(c.get("name") or "")), "tie": c.get("show_tie"), "why": c.get("show_tie_why"),
+             "ids": c.get("show_ids")} for c in cands if isinstance(c, dict) and c.get("step") == "title"][:TOP_N]
+
+
 def _search_cached(http: Http, log: Log, plan: dict, lang: str, anilist_id: int, playing_title: str,
                    tokens: dict | None) -> dict:
     """`search`, cached 24 h per (show, episode, language). Ranking is recomputed from the cached
     candidates, because it depends on the playing release."""
     path = search_cache_path(anilist_id, plan["episode"], lang)
     hit = cached_json(path, SEARCH_TTL_S)
+    stale = [c.get("name") for c in (hit or {}).get("candidates") or [] if isinstance(c, dict)
+             and c.get("step") == "title" and "show_tie" not in c] if isinstance(hit, dict) else []
+    if stale:
+        # Written before title-step files were checked against the entry's ids: those files never were.
+        log.info("extsubs.search", "cache", result="STALE", path=str(path), title_step=len(stale),
+                 names=[_cut(str(n)) for n in stale[:TOP_N]],
+                 reason="title-step files cached before their show ids were checked: searched again")
+        hit = None
     if hit and isinstance(hit.get("candidates"), list):
         log.info("extsubs.search", "cache", result="HIT", path=str(path), candidates=len(hit["candidates"]),
                  years=plan.get("years"), movie=plan.get("movie"), movie_from=plan.get("movie_from"),
-                 format_from=plan.get("format_from"))
+                 format_from=plan.get("format_from"), title_step=_title_step_ties(hit["candidates"]) or None)
         ranked, _ = dedupe_exact(rank(hit["candidates"], playing_title))
         return {"candidates": ranked, "services": hit.get("services") or {}, "lang": lang, "cached": True}
     found = search(http, log, plan, lang, playing_title=playing_title, tokens=tokens)
@@ -1633,6 +1768,8 @@ def track_title(lang: str, t: dict) -> str:
         parts.append(f"shifted {t['offset']:+.1f} s")
     elif not t.get("timing_verified"):
         parts.append("unverified")
+    if untied(t):
+        parts.append("may be another show")
     return " · ".join(parts)
 
 
@@ -1675,9 +1812,11 @@ def load_into_player(log: Log, mpv, tracks: list[dict], lang: str, expect: dict,
                      may_replace: bool) -> dict:
     """Add the tracks to the running player, best first. The best is selected only when the
     viewer has not picked a track since the plugin set one (`plugin_sid`) and either nothing in the
-    language is on or `may_replace` (what is on is an unverified donor and the best file is verified).
-    Checks the episode before every `sub-add`. Never raises; returns what happened."""
-    out = {"added": [], "selected": None, "stopped": None}
+    language is on or `may_replace` (what is on is an unverified donor and the best file is verified), and never
+    when nothing ties it to the entry's show (`untied`: a title search also finds other shows): such a file is
+    added for the viewer to choose (`offered`). Checks the episode before every `sub-add`. Never raises; returns what
+    happened."""
+    out = {"added": [], "selected": None, "stopped": None, "offered": None}
     try:
         now_sid = mpv.command("get_property", "sid")
     except (StageError, OSError) as exc:                # a player that quit resets the socket (OSError)
@@ -1694,6 +1833,9 @@ def load_into_player(log: Log, mpv, tracks: list[dict], lang: str, expect: dict,
                      by=check["by"], why=check["reason"], stamp=check["stamp"])
             break
         select = i == 0 and not viewer_chose and may_replace
+        if select and untied(t):
+            select = False
+            out["offered"] = f"found by title only: {t.get('show_tie_why') or 'nothing ties it to the show'}"
         title = track_title(lang, t)
         try:
             mpv.command("sub-add", t["path"], "select" if select else "auto", title, lang)
@@ -1714,15 +1856,17 @@ def load_into_player(log: Log, mpv, tracks: list[dict], lang: str, expect: dict,
                      title=title, readback=readback)
     log.info("extsubs.load", "done", result="PASS" if out["added"] else "EMPTY", added=[a["title"] for a in out["added"]],
              selected=out["selected"], viewer_chose=viewer_chose, plugin_sid=plugin_sid, sid_now=now_sid,
-             may_replace=may_replace, stopped=out["stopped"])
+             may_replace=may_replace, stopped=out["stopped"], offered=out["offered"],
+             untied=sum(1 for t in tracks if untied(t)), untied_why=_title_step_ties(t for t in tracks if untied(t)))
     return out
 
 
 def update_now_playing(log: Log, expect: dict, lang: str, tracks: list[dict], loaded: dict, mpv=None) -> bool:
-    """The popout's badge: only when a track was selected, and only if the episode is unchanged
-    (with `mpv`, the player stamp too)."""
+    """The popout's badge: when a track was selected, or when files were added but left off as `untied` (the badge
+    alone then says they are there, off); only if the episode is unchanged (with `mpv`, the player stamp too)."""
     from .player import read_now_playing, write_now_playing
-    if not loaded.get("selected"):
+    offered = bool(loaded.get("offered")) and not loaded.get("selected") and bool(loaded.get("added"))
+    if not loaded.get("selected") and not offered:
         return False
     check = still_playing(expect, mpv)
     if not check["playing"]:
@@ -1731,6 +1875,15 @@ def update_now_playing(log: Log, expect: dict, lang: str, tracks: list[dict], lo
         return False
     best = tracks[0]
     np = read_now_playing() or {}
+    if offered:
+        # Only the line: what is on (nothing, or what the play chose) stays as the play wrote it.
+        from .subs import language_name
+        np["subBadge"] = (f"{language_name(file_language(lang, best))} from "
+                          f"{SERVICE_NAMES.get(best['service'], best['service'])} found by title only, may be "
+                          f"another show · not turned on · {len(loaded['added'])} with j")
+        write_now_playing(np)
+        log.info("nowplaying", "external", result="OFFERED", badge=np["subBadge"], reason=loaded["offered"])
+        return True
     np.update({"subSource": "external", "subLang": lang, "subFallback": False,
                "subOffset": round(float(best.get("offset") or 0.0), 3),
                "subTimingVerified": best.get("timing_verified"),
@@ -1750,7 +1903,8 @@ def require_lookup(http: Http, log: Log, mapping: dict, episode: int, variants: 
                    anilist_format: str = "", anilist_titles=()) -> dict | None:
     """Under `subtitlePolicy=require` with no donor: does a subtitle database have a file that fits this
     episode? Search only (cached 24 h, shared with the play's worker), nothing downloaded. Never raises.
-    `season_year` and `anilist_format` come from the titles cache, as they do for the worker's plan."""
+    `season_year` and `anilist_format` come from the titles cache, as they do for the worker's plan. A file nothing
+    ties to the entry's show (`untied`) is not one: the worker would never turn it on."""
     try:
         plan = episode_plan(mapping, episode, variants, season_year=season_year, anilist_format=anilist_format,
                             log=log, anilist_titles=anilist_titles)
@@ -1758,10 +1912,11 @@ def require_lookup(http: Http, log: Log, mapping: dict, episode: int, variants: 
     except Exception as exc:                          # noqa: BLE001 - a failed lookup reads as "none found"
         log.warn("extsubs.require", "lookup", result="FAIL", error=f"{type(exc).__name__}: {exc}")
         return None
-    best = (found.get("candidates") or [None])[0]
+    cands = found.get("candidates") or []
+    best = next((c for c in cands if not untied(c)), None)
     log.info("extsubs.require", "lookup", result="PASS" if best else "EMPTY", movie=plan["movie"],
              movie_from=plan.get("movie_from"), format_from=plan.get("format_from"),
-             candidates=len(found.get("candidates") or []), best=best and best["name"],
+             candidates=len(cands), untied=sum(1 for c in cands if untied(c)), best=best and best["name"],
              services={k: v.get("status") for k, v in (found.get("services") or {}).items()})
     return {k: best.get(k) for k in ("service", "name", "file_id", "downloads")} if best else None
 

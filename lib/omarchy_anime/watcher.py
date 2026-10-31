@@ -30,7 +30,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import core, pending, notify
+from . import core, pending, notify, playstate
 from . import say as saymod
 from .core import CACHE_DIR, Http, Log, StageError, BlockedError  # noqa: F401  (CACHE_DIR is rebound by the tests)
 
@@ -182,17 +182,21 @@ def dub_action(entry: dict) -> dict | None:
 
 
 class Watcher:
-    """One run of the watch loop. `torbox` is the TorBox client (`providers.TorBox`); `notifier` is `notify.send`."""
+    """One run of the watch loop. `torbox` is the TorBox client (`providers.TorBox`); `notifier` is `notify.send`;
+    `sounder` is `notify.ready_sound`, played once a ready notification went out."""
 
-    def __init__(self, log: Log, torbox, notifier=None):
+    def __init__(self, log: Log, torbox, notifier=None, sounder=None):
         self.log, self.torbox = log, torbox
         self.notifier = notifier or notify.send
+        self.sounder = sounder or notify.ready_sound
         self.seen: dict[tuple, dict] = {}       # per entry: polls, due, missing, the last reading
         self.unwritable = False                 # the cache refused `TELL_FAILS` marks: nothing can be told or removed
 
-    def _tell(self, entry: dict, body: str, actions: list[dict], why: str, reading: dict) -> bool:
+    def _tell(self, entry: dict, body: str, actions: list[dict], why: str, reading: dict, sound: bool = False) -> bool:
         """Mark the entry notified (so it is never told twice), send, remove. False when another took it first, or
-        when the notification did not go out: then the mark comes off and a later tick tells again."""
+        when the notification did not go out: then the mark comes off and a later tick tells again. `sound`: the ready
+        sound plays once the notification went out, never for one that did not (the next poll's retry would sound
+        again with nothing on screen). Told, the popout's line says the same, with the click's action (`show_told`)."""
         media, ep, tid = _key(entry)
         if pending.mark(media, ep, tid, self.log, notified=_clock(), notified_why=why) is None:
             still = next((e for e in pending.load() if _key(e) == (media, ep, tid)), None)
@@ -230,7 +234,12 @@ class Watcher:
                           suggest="the notification did not go out (see notify send); the next poll tries again"
                           if unmarked else "the notification did not go out and the entry still reads as told")
             return False
+        if sound:
+            self.sounder(self.log, (sent.get("spec") or {}).get("trace") or getattr(self.log, "trace", ""),
+                         played_reason="the watcher's notification said the episode is ready; the viewer may have "
+                                       "looked away")
         pending.remove(media, ep, self.log, f"told the viewer: {why}", torrent_id=tid)
+        self.show_told(entry, body, actions, why, sent)
         self.log.info("watch", "told", result="PASS", mediaId=media, episode=ep, torrentId=tid, why=why,
                       body=body, actions=[a["name"] for a in actions], state=reading.get("state"),
                       progress=reading.get("progress"))
@@ -239,7 +248,38 @@ class Watcher:
     def ready(self, entry: dict, reading: dict) -> bool:
         body = saymod.ready_body(entry.get("episode"), entry.get("audio"), entry.get("subtitles"))
         return self._tell(entry, body, [{"name": "play", "label": "Play", "args": play_action(entry),
-                                         "click": saymod.CLICK_PLAY}], "ready", reading)
+                                         "click": saymod.CLICK_PLAY}], "ready", reading, sound=True)
+
+    def show(self, entry: dict, reading: dict, now: float) -> dict | None:
+        """The poll's reading on the play's `later` line in the popout (`playstate.later_update`): "Downloading episode
+        1 on TorBox: 71 %", and when (`watch.at`, which keeps a followed wait's line from going after its hour)."""
+        return self._line(entry, message=saymod.later_progress_line(_key(entry)[1], reading),
+                          watch={"reading": dict(reading), "at": now})
+
+    def show_told(self, entry: dict, body: str, actions: list[dict], why: str, sent: dict) -> dict | None:
+        """The tell on the play's `later` line: the notification's body, and its click's action (its label and token:
+        the popout's button runs `notify-click <token>`, the very click) when the notification carried one."""
+        token = sent.get("token")
+        action = {"name": actions[0]["name"], "label": actions[0]["label"], "token": token} if actions and token \
+            else None
+        return self._line(entry, message=body, told={"ready": why == "ready", "why": why, "at": _clock(),
+                                                     "action": action})
+
+    def _line(self, entry: dict, **fields) -> dict | None:
+        """`playstate.later_update` on the entry's play with `fields`. Guarded: the popout's line is the watcher's
+        courtesy, so a raise there (a hand-edited `play-status.json`, a bug) is one `watch line` FAIL, never the end of
+        a run with other waits still to poll and tell."""
+        media, ep, _ = _key(entry)
+        trace = str(entry.get("trace") or "")
+        try:
+            return playstate.later_update(trace, media, ep, self.log, **fields)
+        except Exception as exc:                        # noqa: BLE001 - see the docstring
+            self.log.emit("warn", "watch", "line", result="FAIL", trace=trace, mediaId=media, episode=ep,
+                          told="told" in fields,
+                          reason=f"the popout's line could not be updated: {type(exc).__name__}: {exc}",
+                          suggest="the popout keeps its last line, the notification is unchanged; run: omarchy-anime "
+                                  "trace " + str(getattr(self.log, "trace", "") or "<the watcher's trace>"))
+            return None
 
     def give_up(self, entry: dict, why: str, reading: dict) -> bool:
         reason = saymod.gave_up_reason(why, reading)
@@ -313,6 +353,8 @@ class Watcher:
             return "gave_up" if self.give_up(entry, "age", st["reading"] if item is not None else {}) else "waiting"
         if st["missing"] >= MISSING_POLLS:
             return "gave_up" if self.give_up(entry, "missing", st["reading"]) else "waiting"
+        if item is not None:
+            self.show(entry, st["reading"], now)
         return "waiting"
 
     def reread_token(self) -> bool:
@@ -405,7 +447,7 @@ class Watcher:
                 _sleep(min(nap, CAP_S * (1 + JITTER)))
 
 
-def run(log: Log, settings: dict, torbox=None, notifier=None, max_ticks: int | None = None) -> dict:
+def run(log: Log, settings: dict, torbox=None, notifier=None, max_ticks: int | None = None, sounder=None) -> dict:
     """`omarchy-anime watch`: the single watcher. A second one exits at once (logged)."""
     deadline = time.monotonic() + ACQUIRE_S
     fd = None
@@ -433,7 +475,7 @@ def run(log: Log, settings: dict, torbox=None, notifier=None, max_ticks: int | N
         if torbox is None and token_set():
             from .providers import TorBox
             torbox = TorBox(Http(log, float(settings.get("httpTimeout") or 15)), log, core.read_token("torbox"))
-        out = Watcher(log, torbox, notifier).run(max_ticks=max_ticks)
+        out = Watcher(log, torbox, notifier, sounder).run(max_ticks=max_ticks)
     finally:
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)

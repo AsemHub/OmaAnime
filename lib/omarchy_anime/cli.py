@@ -3924,7 +3924,10 @@ def do_releases(args, log: Log, settings: dict) -> dict:
             data = searches.load(args.anilist_id, args.episode, None)
     if data is None:
         raise StageError("releases", "No search could be made for this episode.", "try again in a moment")
+    known = known_titles(args.anilist_id) or {}
     out = {"ok": True, "trace": log.trace, **searches.public(data, from_cache), "pinned": pins.get(args.anilist_id),
+           # The show's own name, from the titles cache (no request): the picker's ask and its "no release of" line.
+           "show_title": str(known.get("english") or known.get("romaji") or known.get("native") or ""),
            "subtitle_language": settings["subtitleLanguage"], "text_search": bool(offered_by),
            # The tags that are the viewer's language, so the picker line finds it (`BrowseModel._subsText`).
            "subtitle_aliases": sorted(set(LANGUAGE_TABLE.get(settings["subtitleLanguage"], ((), ()))[0])
@@ -3936,14 +3939,42 @@ def do_releases(args, log: Log, settings: dict) -> dict:
     return out
 
 
-def do_picker_notice(args, log: Log) -> dict:
-    """Auto-next refused while the player is up. Say so on screen and lend `p` to the picker;
-    the player stays on the episode that ended. Nothing happens without a running player."""
+# The refusals the release picker can help with: the releases were the trouble (none found, all ruled out, other shows,
+# none would play), not a missing token or a player that would not load a file. `ServiceLogic.PICKER_STAGES` is the
+# shell's copy (`wantsPicker`); a test holds the two equal.
+PICKER_STAGES = ("index.search", "score.prefilter", "score.ambiguous", "score.decision", "score.file_pick", "resolve",
+                 "release.gone")
+
+
+def lend_picker_key(log: Log, args, stage: str, background: bool) -> bool:
+    """A play refused at a picker stage, with the player up for it: `p` there can open the picker on this episode
+    (`player.arm_picker_key`), whatever started the play (Browse, the bar, the player's list, auto-next, a
+    notification's click: each is this command). The player's script decides at each press: the picker only while
+    nothing is watched, else what `p` did. Not from the background: the player is the episode being watched, where `p`
+    is mpv's pause and the refusal draws nothing. Never raises: the refusal is what the caller reports. True when
+    lent."""
+    if stage not in PICKER_STAGES:
+        return False
+    # Every line of the lend names the same three: the refusal's stage and the episode it refused.
+    ids = {"stage_failed": stage, "mediaId": args.anilist_id, "episode": args.episode}
+    if background:
+        log.info("player.picker_key", "arm", result="SKIP", **ids,
+                 reason="the play ran in the background: the player is the episode being watched",
+                 suggest="the popout's Choose a release opens the picker")
+        return False
     mpv = Mpv(log)
-    if not (MPV_SOCKET.exists() and mpv._try_connect()):
-        log.info("player.picker_key", "arm", result="SKIP", reason="no running player")
-        return {"ok": True, "armed": False}
-    return {"ok": True, **playermod.arm_picker_key(mpv, log, args.anilist_id, args.episode)}
+    try:
+        if not (MPV_SOCKET.exists() and mpv._try_connect()):
+            log.info("player.picker_key", "arm", result="SKIP", **ids, reason="no running player",
+                     suggest="the popout's Choose a release opens the picker")
+            return False
+        return bool(playermod.arm_picker_key(mpv, log, args.anilist_id, args.episode, stage).get("armed"))
+    except Exception as exc:                 # noqa: BLE001 - a key binding must never replace the refusal
+        log.warn("player.picker_key", "arm", result="FAIL", **ids, error=f"{type(exc).__name__}: {exc}",
+                 suggest="the popout's Choose a release opens the picker")
+        return False
+    finally:
+        mpv._close()
 
 
 # How long "Tell me when it's ready" watches a signalled play's entry before it answers. The play's handler only
@@ -4373,8 +4404,10 @@ def do_play(args, log: Log, settings: dict) -> dict:
         raise mpvmod.PlayerClosed("mpv.closed", said, "", say=words, cause=exc.data.get("error")) from exc
     except StageError as exc:
         # The reason has to outlive this process: the player and the popout are where it is read,
-        # and neither of them was watching when it happened.
-        status.fail(exc.stage, str(exc), exc.suggest, say=exc.data.get("say") or {})
+        # and neither of them was watching when it happened. `p` is lent first, so the entry says whether it was
+        # (`picker`: the player's red line names the key only then).
+        lent = lend_picker_key(log, args, exc.stage, status.background)
+        status.fail(exc.stage, str(exc), exc.suggest, say=exc.data.get("say") or {}, picker=lent or None)
         raise
     except Exception as exc:                            # noqa: BLE001 - same, for the unexpected kind
         status.fail("internal", f"{type(exc).__name__}: {exc}",
@@ -5185,7 +5218,7 @@ def do_subs_external(args, log: Log, settings: dict) -> dict:
                 "quota": extsubs.quota()}
     found = extsubs.search(http, log, plan, lang, playing_title=args.release or "")
     keys = ("service", "name", "release", "uploader", "downloads", "hearing_impaired", "machine", "format",
-            "season", "episode", "pack", "zip", "check", "step", "affinity", "affinity_why", "file_id")
+            "season", "episode", "pack", "zip", "check", "step", "affinity", "affinity_why", "file_id", "show_tie")
     return {
         "trace": log.trace, "anilist_id": args.anilist_id, "episode": args.episode, "lang": lang,
         "plan": {k: plan[k] for k in ("tmdb", "imdb", "ids_from", "season", "season_episode", "absolute",
@@ -6741,15 +6774,14 @@ def main(argv: list[str] | None = None, from_env: int = 0) -> int:
                                             "or restarted")
     p.add_argument("anilist_id", type=int)
     p.add_argument("episode", type=int)
+    p = sub.add_parser("later-dismiss", help="the popout's Dismiss on a told \"Tell me when it's ready\" line: the "
+                                             "play's entry is marked dismissed, only while it is still that play's")
+    p.add_argument("play_trace")
     p = sub.add_parser("releases", help="the release picker's list for one episode: passed and rejected releases")
     p.add_argument("anilist_id", type=int)
     p.add_argument("episode", type=int)
     p.add_argument("--refresh", action="store_true", help="search again even if the stored search is fresh")
     p.add_argument("--query", metavar="WORDS", help="search with these words instead, through the indexer add-ons that offer text search")
-    p = sub.add_parser("picker-notice", help="a play refused while the player is up (auto-next, or the player's "
-                                             "own episode list): tell the player and lend p to the release picker")
-    p.add_argument("anilist_id", type=int)
-    p.add_argument("episode", type=int)
     p = sub.add_parser("pin", help="the remembered pick for one show: show or forget it")
     p.add_argument("action", choices=["show", "forget"])
     p.add_argument("anilist_id", type=int)
@@ -6972,12 +7004,12 @@ def main(argv: list[str] | None = None, from_env: int = 0) -> int:
             out = do_releases(args, log, settings)
         elif args.cmd == "pin":
             out = do_pin(args, log)
-        elif args.cmd == "picker-notice":
-            out = do_picker_notice(args, log)
         elif args.cmd == "later":
             out = do_later(args, log)
         elif args.cmd == "keep-waiting":
             out = do_keep_waiting(args, log)
+        elif args.cmd == "later-dismiss":
+            out = {"ok": True, "dismissed": playstate.later_dismiss(args.play_trace, log) is not None}
         elif args.cmd == "watch":
             out = watchermod.run(log, settings)
         elif args.cmd == "prefetch":

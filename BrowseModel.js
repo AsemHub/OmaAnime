@@ -774,7 +774,9 @@ function _pickerRow(r, failed, pin, want) {
   return {
     kind: "row", hash: String(r.info_hash || ""), line: _pickerLine(r, want), title: String(r.title || ""),
     note: note, dim: !!r.reason, failed: !!f,
-    pinned: !!(pin && pin.pack && pin.pack.info_hash === r.info_hash)
+    pinned: !!(pin && pin.pack && pin.pack.info_hash === r.info_hash),
+    // Why it was rejected (`searches.row`: a code, the viewer's words, the other show its title names): the ask.
+    reason: r.reason ? String(r.reason) : "", why: String(r.why || ""), show: String(r.show || "")
   }
 }
 
@@ -809,6 +811,153 @@ function pickerItems(data, pin) {
     for (var m = 0; m < rows.length; m++) items.push(_pickerRow(rows[m], failed, pin, want))
   }
   return items
+}
+
+// A rejected release plays at once only when it was rejected for its availability or a preference: nobody sharing it,
+// its size, a whole season with packs turned off. It is this episode of this show. Every other reason says it is not
+// (another show, another season, another episode, a pack that does not hold the episode or whose files do not), and so
+// does a code this list does not know (an add-on's own): those ask first.
+var PICKER_AT_ONCE = ["seeders", "size", "batch"]
+
+// Whether a row rejected for `PICKER_AT_ONCE` counts as another show by its title (`show`, `score.sibling_name`). Alone
+// that name is noisy: over the measurement corpus it is set on 276 of the 1,391 names the release filter keeps as the
+// entry's own, about half of them format words ("pack", "vol", "raw"). It counts only when the ambiguity check found
+// other shows in the same search (an `other_show` row), as under the "Idol" refusal, where the 6 GB Love Live! movies
+// were rejected for their size.
+function _othersFound(data) {
+  var rejected = data && isList(data.rejected) ? data.rejected : []
+  for (var i = 0; i < rejected.length; i++) if (rejected[i].reason === "other_show") return true
+  return false
+}
+
+// A release's name as the ask says it: without its group tags in front ("[Grp]"), its tags behind ("[BD 1080p]",
+// "(…)"), its extension, and what follows its resolution ("1080p BluRay x265 …"), then shortened in the middle to about
+// `PICKER_ASK_TITLE` characters at word ends: "Starlight Chorus! … Lantern Night Festival". The whole name when that
+// would leave nothing.
+var PICKER_ASK_TITLE = 50
+
+function pickerShortTitle(title) {
+  var whole = String(title || "").replace(/\s+/g, " ").trim()
+  var t = whole.replace(/\.(mkv|mp4|avi|webm|ts)$/i, "")
+  t = t.replace(/^(?:\s*[\[(【][^\])】]*[\])】])+\s*/, "")
+  var prev
+  do {
+    prev = t
+    t = t.replace(/\s*[\[(【][^\[\]()【】]*[\])】]\s*$/, "")
+  } while (t !== prev)
+  t = t.replace(/\s+\(?\b(?:2160|1080|720|576|540|480)[pi]\b.*$/i, "").trim()
+  if (!t) t = whole
+  if (t.length <= PICKER_ASK_TITLE) return t
+  var half = Math.floor((PICKER_ASK_TITLE - 3) / 2)
+  var words = t.split(" ")
+  var head = "", tail = ""
+  for (var i = 0; i < words.length; i++) {
+    var h = head ? head + " " + words[i] : words[i]
+    if (h.length > half) break
+    head = h
+  }
+  for (var j = words.length - 1; j >= 0; j--) {
+    var w = tail ? words[j] + " " + tail : words[j]
+    if (w.length > half) break
+    tail = w
+  }
+  head = head.replace(/[\s\-–—:·,]+$/, "")
+  tail = tail.replace(/^[\s\-–—:·,]+/, "")
+  if (!head) head = t.substring(0, half)
+  if (!tail) tail = t.substring(t.length - half)
+  return head + " … " + tail
+}
+
+// The question a pick of this row asks before it plays, or "" when it plays at once (a passed row, or `PICKER_AT_ONCE`
+// with no other show named). `data` is the `releases` answer (`show_title`), `episode` the picker's. It names the
+// release (`pickerShortTitle`), not the other show its title was read as (`show`: normalized words, "Starlight Chorus
+// Club Vostfr Grp Raws …"), which only decides whether a `PICKER_AT_ONCE` row asks.
+function pickerAsk(item, data, episode) {
+  if (!item || item.kind !== "row" || !item.dim) return ""
+  var reason = String(item.reason || "")
+  var show = String(item.show || "")
+  var atOnce = PICKER_AT_ONCE.indexOf(reason) >= 0
+  if (atOnce) {
+    if (!show || !_othersFound(data)) return ""
+  }
+  var title = data && data.show_title ? String(data.show_title) : "this show"
+  var ep = Number(episode) > 0 ? " episode " + Number(episode) : ""
+  var why = String(item.why || "")
+  var name = pickerShortTitle(item.title)
+  var it = name ? "“" + name + "”" : ""
+  if (reason === "other_show" || reason === "series" || atOnce) {
+    var also = atOnce && why ? " It was also ruled out: " + why + "." : ""
+    return (it ? "This is " + it + ", another show" : "This release names another show") + ", not " + title + "."
+           + also + " Play it anyway?"
+  }
+  if (reason === "season")
+    return (it ? "This is " + it + ", another season" : "This release is another season") + ", not " + title + ep
+           + ". Play it anyway?"
+  if (reason === "episode")
+    return (it || "This release's title") + " does not name" + (ep || " this episode") + " of " + title
+           + ". Play it anyway?"
+  if (reason === "pack_range")
+    return (it ? "The pack " + it : "This pack") + " does not hold" + (ep || " this episode") + ". Play it anyway?"
+  if (reason === "pack_files")
+    return (ep ? "Episode " + Number(episode) : "This episode") + " is not among the files of "
+           + (it || "this pack") + ". Play it anyway?"
+  return (it || "This release") + " was ruled out" + (why ? ": " + why : "") + ". Play it anyway?"
+}
+
+// The ask's keys, under its question and on the status line while it asks.
+var PICKER_ASK_KEYS = "Enter or a click plays it · Escape cancels"
+
+// What Enter (or a click) on row `index` does: `{play, reason, confirmed}` plays that release, `{ask: {hash, text,
+// reason}}` asks first (`pickerAsk`), null does nothing (a header, no row). `confirmHash` is the row the viewer
+// confirmed: the ask's own row, by its hash, never whatever the cursor is on now (a mouse drift moves the cursor).
+function pickerDecide(items, index, data, episode, confirmHash) {
+  var item = isList(items) ? items[index] : null
+  if (!item || item.kind !== "row" || !item.hash) return null
+  var text = pickerAsk(item, data, episode)
+  if (!text) return { play: item.hash, reason: item.reason || null, confirmed: false }
+  if (confirmHash && confirmHash === item.hash) return { play: item.hash, reason: item.reason || null, confirmed: true }
+  return { ask: { hash: item.hash, text: text, reason: item.reason || null } }
+}
+
+// The index of the row with this hash, -1 when the list no longer has it.
+function pickerIndexOf(items, hash) {
+  if (!isList(items) || !hash) return -1
+  for (var i = 0; i < items.length; i++) if (items[i].kind === "row" && items[i].hash === hash) return i
+  return -1
+}
+
+// Before the list, when no release passed and some were rejected: that none of them is the show's own, plainly, in
+// the words of what is there. A row rejected for `PICKER_AT_ONCE` may be the show's own (ruled out, not another show:
+// `_othersFound` says when its title's other show counts), so with any such row the line says "passed", not "was
+// found", and calls it ruled out. "" otherwise.
+function pickerNoneOwn(data) {
+  if (!data || typeof data !== "object") return ""
+  var passed = isList(data.releases) ? data.releases.length : 0
+  var rejected = isList(data.rejected) ? data.rejected : []
+  if (passed > 0 || rejected.length === 0) return ""
+  var title = data.show_title ? String(data.show_title) : "this show"
+  var kinds = [], ruled = 0, whys = [], others = _othersFound(data)
+  function kind(k) { if (kinds.indexOf(k) < 0) kinds.push(k) }
+  for (var i = 0; i < rejected.length; i++) {
+    var r = rejected[i], reason = String(r.reason || "")
+    var atOnce = PICKER_AT_ONCE.indexOf(reason) >= 0
+    if (reason === "other_show" || reason === "series" || (r.show && (others || !atOnce))) kind("other shows")
+    else if (reason === "season") kind("other seasons")
+    else if (reason === "episode" || reason === "pack_range" || reason === "pack_files") kind("other episodes")
+    else if (atOnce) {
+      ruled++
+      if (r.why && whys.indexOf(String(r.why)) < 0) whys.push(String(r.why))
+    } else kind("releases ruled out for another reason")
+  }
+  function joined(list) {
+    return list.length <= 1 ? list.join("") : list.slice(0, -1).join(", ") + " and " + list[list.length - 1]
+  }
+  var because = whys.length ? " (" + whys.slice(0, 2).join(", ") + ")" : ""
+  if (ruled === 0) return "No release of " + title + " was found. These are " + joined(kinds) + "."
+  if (kinds.length === 0) return "No release of " + title + " passed: every one here was ruled out" + because + "."
+  return "No release of " + title + " passed. " + ruled
+         + (ruled === 1 ? " of these was ruled out" : " of these were ruled out") + because + "; the rest are "
+         + joined(kinds) + "."
 }
 
 // `/` (own-words search) only when `releases` says a loaded indexer add-on offers text

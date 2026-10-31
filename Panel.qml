@@ -60,6 +60,17 @@ Panel {
   readonly property var playChoice: anime && typeof anime.runChoice === "function"
                                     ? Model.playChoice(anime.playEntry, choiceClock) : null
 
+  // Which line the status line shows (`Logic.statusLineKind`, where the order is tested): "" for none.
+  readonly property string statusKind: Logic.statusLineKind(progressRows.length, loaded, anime ? {
+    lastError: anime.lastError, notice: anime.notice, busy: anime.busy, held: anime.playHeld, later: anime.playLater
+  } : null)
+
+  // The watcher told about the "Tell me when it's ready" episode, and the status line says so (nothing more pressing
+  // above it): its buttons, the notification's own action and Dismiss (`Service.playLaterTold`). A Service older than
+  // this file has no `runLaterAction`: none are shown, and the notification still plays it.
+  readonly property var laterTold: anime && typeof anime.runLaterAction === "function" && !!anime.playLaterTold
+                                   && statusKind === "later" ? anime.playLaterTold : null
+
   Timer {
     interval: 1000
     repeat: true
@@ -440,18 +451,16 @@ Panel {
       // "Nothing playing"/"Player not running" default.
       Text {
         width: parent.width
-        visible: root.progressRows.length === 0
-                && (!root.loaded || (!!root.anime && (root.anime.busy !== "" || root.anime.lastError !== ""
-                                                       || root.anime.notice !== "" || !!root.anime.playHeld
-                                                       || !!root.anime.playLater)))
+        visible: root.statusKind !== ""
         text: {
-          if (!root.anime) return "Service not loaded"
+          var kind = root.statusKind
+          if (kind === "service" || !root.anime) return "Service not loaded"
           // The cause, then the one thing to do about it, then —
           // when the CLI sent one — the hint behind it. Service.qml sets `lastErrorHeadline` from
           // `Logic.errorSentences` for a play adopted off the poll and for one this Service started
           // itself alike, so it is blank only for "play returned no JSON" — a response that never
           // had a `say` to read — where `errorHeadline()`/`errorAction()` are the old rendering.
-          if (root.anime.lastError !== "") {
+          if (kind === "error") {
             var sentenced = root.anime.lastErrorHeadline !== ""
             var headline = sentenced ? root.anime.lastErrorHeadline : root.anime.errorHeadline()
             var action = sentenced ? root.anime.lastErrorAction : root.anime.errorAction()
@@ -461,22 +470,48 @@ Panel {
             return text
           }
           // A standing notice (token expiry, AniList budget), not a failure.
-          if (root.anime.notice !== "") return root.anime.notice
-          if (root.anime.busy !== "") return root.anime.busy
+          if (kind === "notice") return root.anime.notice
+          if (kind === "busy") return root.anime.busy
           // A play holding the viewer's choices after its wait for TorBox: a plain sentence, dimmed, not an
           // error; its choices are the buttons below (an old Service: on the player's loading screen and in Browse).
-          if (root.anime.playHeld) return root.anime.playHeld + (root.playChoice ? ""
-                                                                 : "\nThe player and Browse have your choices.")
-          // "Tell me when it's ready" was recorded: its acknowledgement, for the hour it is current.
-          if (root.anime.playLater) return root.anime.playLater
+          if (kind === "held") return root.anime.playHeld + (root.playChoice ? ""
+                                                             : "\nThe player and Browse have your choices.")
+          // "Tell me when it's ready" was recorded: its acknowledgement, then the watcher's progress or its tell,
+          // for as long as `Logic.laterShownUntil` keeps it current (the hour, a followed wait, a told day).
+          if (kind === "later") return root.anime.playLater
           return root.anime.running ? "Nothing playing" : "Player not running"
         }
         textFormat: Text.PlainText
-        color: !!root.anime && (root.anime.lastError !== "" || root.anime.notice !== "")
-               ? Commons.Color.accent : root.dim
+        color: root.statusKind === "error" || root.statusKind === "notice" ? Commons.Color.accent : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         wrapMode: Text.Wrap
+      }
+
+      // The told line's buttons: Play (or a give-up's "Watch the English dub"), the notification's click, and Dismiss.
+      Flow {
+        width: parent.width
+        spacing: Style.space(6)
+        visible: !!root.laterTold
+
+        Button {
+          visible: !!root.laterTold && !!root.laterTold.action
+          text: root.laterTold && root.laterTold.action ? root.laterTold.action.label : ""
+          bordered: true
+          foreground: root.foreground
+          accent: Commons.Color.accent
+          fontFamily: root.fontFamily
+          onClicked: root.anime.runLaterAction()
+        }
+
+        Button {
+          text: "Dismiss"
+          bordered: true
+          foreground: root.foreground
+          accent: Commons.Color.accent
+          fontFamily: root.fontFamily
+          onClicked: root.anime.dismissLater()
+        }
       }
 
       // The waiting (or held) play's choices: its sentence while it asks, then one button per choice with its key.

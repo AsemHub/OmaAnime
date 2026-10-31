@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.asemhub.omaanime",
   "name": "Anime",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "AsemHub",
   "license": "MIT",
   "description": "Watch your AniList anime through TorBox with preferred-language subtitles: one click to play, one click to hide, progress written back to AniList.",

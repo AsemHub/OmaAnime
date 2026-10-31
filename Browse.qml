@@ -156,7 +156,11 @@ Item {
       && Number(service.pickerData.anilist_id) === pickerMediaId
       && Number(service.pickerData.episode) === pickerEpisode ? service.pickerData : null
   readonly property var pickerItems: Model.pickerItems(pickerData, pickerData ? pickerData.pinned : null)
+  // The question a pick of a rejected row asks before it plays (`Model.pickerDecide`): `{hash, text, reason}`, null
+  // when none is asked. A new list (a refresh, another episode, a failed pick's reload) drops it unanswered.
+  property var pickerConfirm: null
   onPickerItemsChanged: {
+    pickerConfirm = null
     var first = Model.pickerFirst(pickerItems)
     if (pickerIndex >= pickerItems.length || !pickerItems[pickerIndex] || pickerItems[pickerIndex].kind !== "row")
       pickerIndex = Math.max(0, first)
@@ -393,6 +397,7 @@ Item {
     root.pickerMediaId = Number(mediaId)
     root.pickerEpisode = Number(episode)
     root.pickerIndex = 0
+    root.pickerConfirm = null
     root.pickerOpen = true
     pickerField.text = ""
     root.svc.loadReleases(mediaId, episode, refresh === true)
@@ -404,6 +409,7 @@ Item {
   function closePicker() {
     if (!root.pickerOpen) return
     root.pickerOpen = false
+    root.pickerConfirm = null
     if (root.detailOpen) root.loadPin()
     Qt.callLater(function () { if (root.opened) keyCatcher.forceActiveFocus() })
   }
@@ -422,16 +428,58 @@ Item {
     root.pickerIndex = Model.pickerStep(root.pickerItems, root.pickerIndex, delta)
   }
 
-  // Enter: exactly this release. The sheet stays up under the busy line; a success dismisses
-  // the overlay like any play, a failure comes back here with the row marked (Service.pickerWanted).
-  function pickerPlay() {
+  // Enter: exactly this release. A rejected row that is not this episode of this show asks first
+  // (`Model.pickerDecide`); `confirmHash` is the row the viewer confirmed, by its hash, and `askTrace` the ask's own
+  // trace (the ask, its answer and the play it led to are one trace's lines). The sheet stays up under the busy line;
+  // a success dismisses the overlay like any play, a failure comes back here with the row marked
+  // (Service.pickerWanted).
+  function pickerPlay(confirmHash, askTrace) {
+    if (!root.service) return
     var item = root.pickerItems[root.pickerIndex]
-    if (!root.service || !item || item.kind !== "row") return
-    var trace = root.svc.play(root.pickerMediaId, root.pickerEpisode, item.hash)
+    var d = Model.pickerDecide(root.pickerItems, root.pickerIndex, root.pickerData, root.pickerEpisode, confirmHash)
+    if (!d) return
+    if (d.ask) {
+      d.ask.trace = root.svc.newTrace("picker-ask")
+      root.pickerConfirm = d.ask
+      root.svc.logEvent(d.ask.trace, "ui.picker.ask",
+                        { mediaId: root.pickerMediaId, episode: root.pickerEpisode, release: d.ask.hash,
+                          reason: d.ask.reason, index: root.pickerIndex, text: d.ask.text })
+      return
+    }
+    root.pickerConfirm = null
+    var trace = root.svc.play(root.pickerMediaId, root.pickerEpisode, d.play)
+    if (d.confirmed && askTrace)
+      root.svc.logEvent(askTrace, "ui.picker.ask_confirm",
+                        { mediaId: root.pickerMediaId, episode: root.pickerEpisode, release: d.play,
+                          reason: d.reason, playTrace: trace || null, played: !!trace })
     if (!trace) return
     root.playPending = true
     root.svc.logEvent(trace, "browse.pick", { mediaId: root.pickerMediaId, episode: root.pickerEpisode,
-                                              release: item.hash, rejected: item.dim, index: root.pickerIndex })
+                                              release: d.play, rejected: item.dim, reason: d.reason,
+                                              confirmed: d.confirmed, askTrace: d.confirmed ? (askTrace || null) : null,
+                                              index: root.pickerIndex })
+  }
+
+  // The ask's Enter, or a click on it: the row it asked about, wherever the cursor is now (a mouse drift moves it).
+  function pickerConfirmPlay() {
+    var asked = root.pickerConfirm
+    if (!asked) return
+    var at = Model.pickerIndexOf(root.pickerItems, asked.hash)
+    root.pickerConfirm = null
+    if (at < 0) return
+    root.pickerIndex = at
+    root.pickerPlay(asked.hash, asked.trace)
+  }
+
+  // The ask's Escape: nothing plays and the list stays.
+  function pickerCancelAsk() {
+    var asked = root.pickerConfirm
+    if (!asked) return
+    root.pickerConfirm = null
+    if (root.service)
+      root.svc.logEvent(asked.trace || root.svc.newTrace("picker-ask"), "ui.picker.ask_cancel",
+                        { mediaId: root.pickerMediaId, episode: root.pickerEpisode, release: asked.hash,
+                          reason: asked.reason })
   }
 
   // `from` says where (`settingsFrom`). Asked again while it is open, the window is shown again rather than reset,
@@ -1705,6 +1753,21 @@ Item {
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function (event) {
+          // The ask owns the keyboard until it is answered: Enter plays the row it names, Escape cancels it.
+          if (root.pickerOpen && root.pickerConfirm) {
+            switch (event.key) {
+            case Qt.Key_Return:
+            case Qt.Key_Enter:
+              root.pickerConfirmPlay()
+              break
+            case Qt.Key_Escape:
+            case Qt.Key_Backspace:
+              root.pickerCancelAsk()
+              break
+            }
+            event.accepted = true
+            return
+          }
           if (root.pickerOpen) {
             switch (event.key) {
             case Qt.Key_Escape:
@@ -2208,7 +2271,8 @@ Item {
             // A play asked for meanwhile, and refused, says so under the one that is starting.
             if (root.service.busy !== "")
               return root.service.busy + (root.service.playRefusal ? "\n" + root.service.playRefusal : "")
-            // The refusal is the picker's own summary line; down here, the keys.
+            // The refusal is the picker's own summary line; down here, the keys (the ask's while it asks).
+            if (root.pickerOpen && root.pickerConfirm) return Model.PICKER_ASK_KEYS
             if (root.pickerOpen) return Model.pickerKeys(root.pickerData)
             if (root.service.lastError !== "")
               return root.svc.errorHeadline() + "\n" + root.svc.errorDetail()
@@ -2330,6 +2394,19 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
+
+          // No release passed: that none of these is the show's own, before the list (`Model.pickerNoneOwn`).
+          Text {
+            width: parent.width
+            visible: text !== ""
+            text: root.pickerData ? Model.pickerNoneOwn(root.pickerData) : ""
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
         }
 
         Item {
@@ -2342,9 +2419,65 @@ Item {
           anchors.right: parent.right
           visible: root.pickerOpen
 
+          // The ask (`root.pickerConfirm`), under the list, which ends above it (no row hides behind it, and a click
+          // lands on the row under the pointer): its question, and its keys. A click on it is its Enter.
+          Rectangle {
+            id: pickerAsk
+            z: 2
+            visible: !!root.pickerConfirm
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            height: pickerAskText.implicitHeight + pickerAskKeys.implicitHeight + Style.spacing.sm
+                    + 2 * Style.spacing.md
+            radius: Style.cornerRadius
+            color: root.background
+            border.color: Commons.Color.accent
+            border.width: Math.max(1, Style.space(1))
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.pickerConfirmPlay()
+            }
+
+            Column {
+              anchors.fill: parent
+              anchors.margins: Style.spacing.md
+              spacing: Style.spacing.sm
+
+              Text {
+                id: pickerAskText
+                width: parent.width
+                text: root.pickerConfirm ? root.pickerConfirm.text : ""
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Text {
+                id: pickerAskKeys
+                width: parent.width
+                text: Model.PICKER_ASK_KEYS
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
           ListView {
             id: pickerList
-            anchors.fill: parent
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: pickerAsk.visible ? pickerAsk.top : parent.bottom
+            anchors.bottomMargin: pickerAsk.visible ? Style.spacing.sm : 0
+            // Shorter while it asks: the asked row (the cursor's) stays in view above the question.
+            onHeightChanged: if (pickerAsk.visible) positionViewAtIndex(currentIndex, ListView.Contain)
             clip: true
             model: root.pickerItems
             currentIndex: root.pickerIndex
@@ -2376,9 +2509,11 @@ Item {
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onContainsMouseChanged: if (containsMouse) root.pickerIndex = pickItem.index
+                // A click on the row the ask names confirms it; on any other row, that row's own pick.
                 onClicked: {
                   root.pickerIndex = pickItem.index
-                  root.pickerPlay()
+                  root.pickerPlay(root.pickerConfirm ? root.pickerConfirm.hash : "",
+                                  root.pickerConfirm ? root.pickerConfirm.trace : "")
                 }
               }
 

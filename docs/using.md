@@ -46,7 +46,7 @@ route.
 | `c` | Top 100: show or hide the shows you have completed |
 | `r` | Reload the current view from AniList, ignoring the cache |
 | `w` | Detail: add the show to your list as Watching, keeping its progress |
-| `p` | Detail: choose the release for the selected episode. After a refused play: choose one for it |
+| `p` | Detail: choose the release for the selected episode. After a refused play: choose one for it (in the player too) |
 | `t` | Copy the trace id of the last failed play to the clipboard |
 | `Escape` | Detail: back. List: close the overlay |
 
@@ -84,10 +84,18 @@ ones that passed first, in the order auto-play ranks them (the top one is what i
 the ruled-out ones, dimmed, grouped by why (another show, nobody sharing, the wrong size, outside
 the pack's range…). Each row names the group, resolution, size, how many are sharing it, the
 subtitles (your language named, the rest counted), and the other show its title belongs to, if any.
+When none of them passed, the top of the list says so first: "No release of *show* was found. These
+are other shows and other episodes." (or that its own releases were all ruled out, and why).
+
+A ruled-out release that is not this episode of this show — another show, another season, another
+episode, a pack that does not hold the episode — asks before it plays, naming why: "This is *Other
+Show*, another show, not *show*. Play it anyway?" `Enter` or a click plays it, `Escape` cancels. One
+ruled out only because nobody is sharing it, for its size or as a whole season plays at once, unless
+its title names another show and the search found other shows (as when auto-play refused them).
 
 | Key | Does |
 |---|---|
-| `Enter` | Play exactly this release. It overrides every filter; if it fails, the list comes back with the row marked |
+| `Enter` | Play exactly this release. It overrides every filter (a ruled-out one asks first, as above); if it fails, the list comes back with the row marked |
 | `/` | Search with your own words, through the indexer add-ons that offer text search; not offered when none does (`Escape` returns to the list) |
 | `r` | Search again automatically (and leave your own-words results) |
 | `x` | Forget this show's pin |
@@ -103,8 +111,26 @@ for 6 hours that play looks for another copy instead. It is skipped only when fe
 sharing it when you picked it (within the last day). Releases from the same group are preferred
 afterwards, though never over one that has your subtitle language. The episode grid shows `Pinned: <group> · pack a–b` while a pin is set.
 
-If auto-next refuses while the player is up, the player says so and `p` there opens the list above
-the video. The popout offers **Choose a release** after a refused play.
+When a play is refused while the player is up — started from Browse, the bar, the player's own episode list,
+auto-next or a notification — the player's red line ends "Press p to choose a release." and `p` there opens the list
+above the video; a release you pick plays in the same player. While an episode is being watched on the player (a
+paused one, or one you sought back into from its end) `p` stays pause, and the red line does not offer it. A player
+that was already running when the plugin updated keeps its older script and is not lent `p`: `omarchy-anime player
+restart` once. The popout offers **Choose a release** after a refused play.
+
+### Tell me when it's ready
+
+When TorBox has to download the episode first, the play offers **Tell me when it's ready**. The
+player then stops waiting, and the plugin follows the download in the background. Until it is done, the
+popout's line shows TorBox's latest reading, refreshed about every half minute to six minutes:
+"Downloading episode 1 on TorBox: 71 %", or "Waiting for episode 1 on TorBox: it is finding people
+who share it" before the download starts. When TorBox has it, a notification says so, with a sound
+(none when do-not-disturb is on). The popout's line changes to "Episode 1 is ready in Japanese." and
+offers **Play**, which does the same as clicking the notification, and **Dismiss**. If the download
+is given up (TorBox no longer has it, nobody shares it, or a day has passed), the line gives the
+reason instead, without a sound. That line stays up to a day: until you play this or another
+episode, or dismiss it. If you asked about several episodes, the line follows the most recent
+one, and each of the others still gets its own notification and sound.
 
 Cover images are downloaded by the plugin's own process, never by the shell, so on a cold cache the
 rows appear immediately with placeholders and the covers land a few seconds later. After that they

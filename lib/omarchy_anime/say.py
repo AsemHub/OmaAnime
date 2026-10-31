@@ -582,6 +582,22 @@ def later_line(episode) -> str:
     return f"We'll tell you when episode {episode} is ready." if episode else "We'll tell you when it's ready."
 
 
+def later_progress_line(episode, reading: dict | None) -> str:
+    """The popout's line while the watcher follows a "Tell me when it's ready" download, from its latest TorBox reading
+    (`state`, `progress`, `downloaded`): "Downloading episode 1 on TorBox: 71 %"; before TorBox downloads, what it is
+    doing ("Waiting for episode 1 on TorBox: it is finding people who share it"). No speed and no time left: the
+    watcher reads TorBox every 30 s to 5 minutes and keeps no byte rate, and TorBox's own `eta` is never said
+    (`_numbers`). TorBox's state names never reach the viewer."""
+    reading = reading or {}
+    kind = _reading_kind(reading)
+    numbers = _numbers(reading, kind, speed=False)
+    if kind == "downloading":
+        return f"Downloading episode {episode} on TorBox: {numbers}"
+    if kind == "have":                               # the watcher tells at once: its line is the tell's, not this
+        kind = "finishing"
+    return f"Waiting for episode {episode} on TorBox: {_UNTIL_DONE_WORDS[kind]}" + (f" ({numbers})" if numbers else "")
+
+
 def wait_stopped(progress) -> dict:
     """The play was stopped while it waited for TorBox's download; the download carries on there."""
     return {"headline": f"Stopped while TorBox was downloading it ({int(progress or 0)} %).",

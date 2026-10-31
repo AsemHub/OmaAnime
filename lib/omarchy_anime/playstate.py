@@ -50,6 +50,12 @@ LATER = "later"
 # `omarchy-anime-episodes.lua`'s `HELD_SHOW_S`, `BrowseModel.HELD_SHOW_S` and `ServiceLogic.HELD_SHOW_S`
 # (`test_wait_choice.TheMirrors` holds them equal).
 HELD_SHOW_S = 3600.0
+# A `later` play the watcher has told about (ready, or given up: `told` on its entry, `later_update`) stays this long
+# after the tell, until a new play claims or the viewer dismisses it: the viewer may have missed the notification, and
+# a ready episode is still to be played. A day: the watcher's own `GIVE_UP_S`, and how long Omarchy 4.5's history
+# keeps a closed notification (`RETENTION_HOURS` 24), whose click plays the same. Mirrored by `ServiceLogic.TOLD_SHOW_S`
+# (`test_later_line` holds them equal). A wait the watcher still follows counts `HELD_SHOW_S` from its newest reading.
+TOLD_SHOW_S = 24 * 3600.0
 
 # An entry nobody is visibly working on is abandoned after this long. It is a floor on trust, not a
 # cap on how long a play may take: a claim whose process is alive keeps it however slow the play is.
@@ -438,8 +444,10 @@ class _Claim:
     """`flock` around the read-modify-write. Two clicks 200 ms apart are two processes reaching this
     at once, and without the lock both read "nothing in flight" and both claim."""
 
-    def __init__(self, log: Log, wait: float = LOCK_WAIT_S):
+    def __init__(self, log: Log, wait: float = LOCK_WAIT_S, unlocked: str = ""):
         self.log, self.wait, self.fd = log, wait, None
+        self.held = False              # whether the lock was had (a claim goes ahead without it; `later_update` not)
+        self.unlocked = unlocked       # what the caller does without the lock, for the FAIL line ("" = a claim's)
 
     def __enter__(self):
         path = lock_file()
@@ -448,18 +456,20 @@ class _Claim:
             self.fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         except OSError as exc:
             self.log.warn("play.claim", "lock", result="FAIL", error=str(exc),
-                          suggest="claiming without the lock; a simultaneous play could race")
+                          suggest=f"the lock file could not be opened; {self.unlocked}" if self.unlocked
+                          else "claiming without the lock; a simultaneous play could race")
             return self
         deadline = time.monotonic() + self.wait
         while True:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.held = True
                 return self
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN) or time.monotonic() >= deadline:
                     # Never block the user's click on a lock. Go ahead and say so.
                     self.log.warn("play.claim", "lock", result="FAIL", error=str(exc), waited=self.wait,
-                                  suggest="another play held the claim lock; proceeding unlocked")
+                                  suggest=f"another play held the claim lock; {self.unlocked or 'proceeding unlocked'}")
                     return self
                 time.sleep(0.02)
 
@@ -470,7 +480,81 @@ class _Claim:
             finally:
                 os.close(self.fd)
             self.fd = None
+        self.held = False
         return False
+
+
+def later_update(trace: str, media_id, episode, log: Log, **fields) -> dict | None:
+    """The watcher's news on the `later` entry of the play `trace` ("Tell me when it's ready"): each poll's reading
+    (`message`, `watch`), then the tell (`message`, `told`). Under the claim lock and read back, only while the entry
+    is still that play's `later` for that episode, not a play ready in the background (`readyInBackground`), and not
+    told already when the news is a reading (a told line never goes back to a percentage). The lock not had within
+    `LOCK_WAIT_S` is a claim replacing the entry: nothing is written. Read back under the lock, so a claim cannot land
+    between the write and the read: a write that did not read back is the cache's fault. The entry as read back, or
+    None; one `watch line` log line either way (a reading's PASS at debug: one a poll)."""
+    why, failed, back = "", False, {}
+    with _Claim(log, unlocked="the watcher writes nothing on the popout's line") as claim:
+        entry = read() or {}
+        if not claim.held:
+            why = "the claim lock was not had: a play is claiming over the entry"
+        elif entry.get("trace") != trace or not trace:
+            why = "the entry is another play's now"
+        elif entry.get("state") != LATER:
+            why = f"the play is {entry.get('state') or 'gone'}, not ended later yet"
+        elif (int(entry.get("mediaId") or 0), int(entry.get("episode") or 0)) != (int(media_id), int(episode)):
+            why = "the entry is another episode's"
+        elif (entry.get("detail") or {}).get("readyInBackground"):
+            why = "the entry is a play ready in the background"
+        elif entry.get("told") and "told" not in fields:
+            why = "the entry was told already"
+        else:
+            try:
+                write_entry({**entry, **fields})
+            except OSError as exc:              # a full or read-only cache: the line keeps its last words
+                why, failed = f"play-status.json could not be written: {exc}", True
+            else:
+                back = read() or {}
+    landed = not why and back.get("trace") == trace and all(back.get(k) == v for k, v in fields.items())
+    if not why and not landed:
+        why, failed = "the entry did not read back", True
+    told = "told" in fields
+    log.emit("warn" if failed else "info" if told or why else "debug", "watch", "line",
+             result="FAIL" if failed else "PASS" if landed else "SKIP", trace=trace, mediaId=int(media_id),
+             episode=int(episode), told=told, message=fields.get("message"), found=entry.get("trace"),
+             state=entry.get("state"), reason=why or "the popout's line is this now",
+             suggest="the popout keeps its last line; free space or fix the cache folder's permissions" if failed
+             else "")
+    return back if landed else None
+
+
+def later_dismiss(trace: str, log: Log) -> dict | None:
+    """The viewer's Dismiss on a told `later` line (`told` on the entry): `dismissedAt` on the entry, under the claim
+    lock, only while it is still that play's told `later`, and read back under it, as `later_update` does. The lock
+    not had within `LOCK_WAIT_S` is a claim replacing the entry: nothing is written (a dismiss written then would put
+    the told line back over the new play's entry). The entry as read back, or None; one `play.later dismiss` line."""
+    why, failed, back = "", False, {}
+    with _Claim(log, unlocked="the dismiss writes nothing") as claim:
+        entry = read() or {}
+        if not claim.held:
+            why = "the claim lock was not had: a play is claiming over the entry"
+        elif not (bool(trace) and entry.get("trace") == trace and entry.get("state") == LATER
+                  and bool(entry.get("told"))):
+            why = "the entry is not this play's told later line"
+        else:
+            try:
+                write_entry({**entry, "dismissedAt": time.time()})
+            except OSError as exc:              # a full or read-only cache: the next poll shows the line again
+                why, failed = f"play-status.json could not be written: {exc}", True
+            else:
+                back = read() or {}
+                if back.get("trace") != trace or not back.get("dismissedAt"):
+                    why, failed = "the entry did not read back", True
+    log.emit("warn" if failed else "info", "play.later", "dismiss", result="FAIL" if failed else "SKIP" if why
+             else "PASS", trace=trace, found=entry.get("trace"), state=entry.get("state"), told=bool(entry.get("told")),
+             reason=why or "the viewer dismissed the told line",
+             suggest="the line comes back on the next poll; free space or fix the cache folder's permissions" if failed
+             else "")
+    return None if why else back
 
 
 class PlayStatus:

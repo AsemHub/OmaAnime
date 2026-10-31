@@ -1184,30 +1184,60 @@ def read_episodes(media_id) -> dict | None:
 
 
 # ----------------------------------------------------------------------------- picker key
-# Auto-next refused inside the player. The player stays on the ended episode, says so, and `p`
-# opens the release picker. `p` is borrowed from whatever it did (mpv's own default is `cycle pause`)
-# and the next play gives it back, so the viewer's key map is never changed for good.
+# A play refused inside the player (`cli.lend_picker_key`). The player stays where it is, its red line says so
+# (`detail.picker` on the failed entry), and `p` can open the release picker. `p` is borrowed from whatever it did
+# (mpv's own default is `cycle pause`) and the next play gives it back, so the viewer's key map is never changed for
+# good.
+# What a press does is decided at the press, by the player's script (`picker-key`): the picker only while nothing is
+# watched and the entry still says it lent `p`; over an episode being watched (a paused one in a hidden window, an
+# ended one sought back) `p` does what it did, the saved command, quoted as one word (mpv's double quotes read JSON
+# escapes). The command holds no word of the show (a command line is readable by every account): the Service reads the
+# refused play from `status` (`refusedPicker`). `media_id` and `episode` are for the log.
 PICKER_KEY = "p"
 PICKER_KEY_FILE = RUNTIME_DIR / f"{APP_NAME}-picker-key.json"
-_PICKER_CMD = f"run omarchy-shell {APP_NAME} picker"
+_PICKER_CMD = "script-message-to omarchy_anime_episodes picker-key"
+# The borrow's own bindings, this one's and the ones before it: never saved as what `p` did.
+_PICKER_OWN = (_PICKER_CMD, f"run omarchy-shell {APP_NAME} ")
+# Set by the player's script on load: it handles `picker-key`. A player started before its script had it (mpv reads
+# `--script=` once, at start) or one without the script answers "property not found" (probed on mpv 0.41, both), and
+# there a `p` bound to the message would do nothing at all, not even pause: nothing is lent.
+PICKER_READY = "user-data/omarchy-anime/picker-key"
 
 
-def arm_picker_key(mpv, log: Log, media_id: int, episode: int) -> dict:
+def picker_binding(restore: str) -> str:
+    return f"{_PICKER_CMD} {json.dumps(str(restore), ensure_ascii=False)}"
+
+
+def picker_key_ready(mpv) -> bool:
+    try:
+        return mpv.command("get_property", PICKER_READY) is True
+    except StageError as exc:
+        if "property not found" not in str(exc):
+            raise                            # no reply, a closed player: the lend's FAIL line says which
+        return False
+
+
+def arm_picker_key(mpv, log: Log, media_id: int, episode: int, stage: str = "") -> dict:
+    if not picker_key_ready(mpv):
+        log.info("player.picker_key", "arm", result="SKIP", stage_failed=stage, mediaId=int(media_id),
+                 episode=int(episode), key=PICKER_KEY, ready=PICKER_READY,
+                 reason="the running player predates its script: it cannot handle the press",
+                 suggest="`omarchy-anime player restart` loads it; until then p stays what it was and the popout's "
+                         "Choose a release opens the picker")
+        return {"armed": False, "key": PICKER_KEY}
     saved = cached_json(PICKER_KEY_FILE, None)
     if not isinstance(saved, dict):
         bindings = mpv.command("get_property", "input-bindings") or []
         mine = [b for b in bindings if b.get("key") == PICKER_KEY
-                and not str(b.get("cmd") or "").startswith(_PICKER_CMD)]
+                and not str(b.get("cmd") or "").startswith(_PICKER_OWN)]
         top = max(mine, key=lambda b: b.get("priority") or 0, default=None)
         saved = {"key": PICKER_KEY, "cmd": (top or {}).get("cmd") or "ignore"}
         write_cache(PICKER_KEY_FILE, saved)
-    cmd = f"{_PICKER_CMD} {int(media_id)} {int(episode)}"
-    mpv.command("keybind", PICKER_KEY, cmd)
-    text = f"No safe release for episode {int(episode)}. Press p to choose one."
-    mpv.command("show-text", text, 15000)
-    log.info("player.picker_key", "arm", result="PASS", key=PICKER_KEY, cmd=cmd, restores=saved["cmd"],
-             mediaId=int(media_id), episode=int(episode))
-    return {"armed": True, "key": PICKER_KEY, "restores": saved["cmd"], "text": text}
+    bound = picker_binding(saved["cmd"])
+    mpv.command("keybind", PICKER_KEY, bound)
+    log.info("player.picker_key", "arm", result="PASS", stage_failed=stage, mediaId=int(media_id),
+             episode=int(episode), key=PICKER_KEY, cmd=bound, restores=saved["cmd"])
+    return {"armed": True, "key": PICKER_KEY, "restores": saved["cmd"]}
 
 
 def disarm_picker_key(mpv, log: Log) -> bool:
