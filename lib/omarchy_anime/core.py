@@ -19,7 +19,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 # The name the plugin's own directories and runtime files carry, so it shares none of them with another
 # plugin with the same CLI name; the CLI binary keeps its `omarchy-anime` name because it lives
 # inside the plugin folder.

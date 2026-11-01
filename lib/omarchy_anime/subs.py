@@ -914,6 +914,68 @@ def strip_ass_attachments(text: str) -> tuple[str, list[str], int]:
     return out, cut, len(text) - len(out)
 
 
+# ffmpeg's `ass` probe, measured with ffprobe n9.0.2 on 2026-11-01: one byte-order mark and any CR/LF are skipped, then
+# the bytes must be `[Script Info]` exactly. A space or tab before it, a `;` line first or another case fails (a case
+# variant opens as `lrc`), and mpv then refuses the file in `sub-add`. An uploader's banner in place of that line
+# (one cached file in 33) is moved below the header as comments. ASS text is told by a line libass reads
+# (`_ASS_CONTENT`); the first such line ends the banner (`_ASS_LINE`: a section header, or a `[Script Info]` field
+# named in the ASS spec, so a banner's `https://` or `Ripped by: x` is not one). An SRT's caption `[Events]` is not
+# a reason: WebVTT, text with a `-->` line before its first ASS line, or a banner over `REPAIR_MAX_LINES`, is left.
+_ASS_PROBE = "[Script Info]"
+_VTT_PROBE = "WEBVTT"                           # ffmpeg's `webvtt` probe: these bytes, after the same skips
+_ASS_CONTENT = re.compile(r"^[\ufeff \t]*(?:\[(?:v4\+? styles|events)\]|scripttype[ \t]*:)", re.I | re.M)
+_ASS_SECTIONS = _LIBASS_HEADERS + _ATTACHMENT_HEADERS + ("[aegisub project garbage]", "[aegisub extradata]")
+_ASS_FIELD = re.compile(r"(?:scripttype|title|playres[xy]|playdepth|wrapstyle|scaledborderandshadow|collisions|timer"
+                        r"|original (?:script|translation|editing|timing)|synch point|script updated by"
+                        r"|update details|ycbcr matrix|layoutres[xy]|kerning|language)[ \t]*:", re.I)
+REPAIR_MAX_LINES = 20
+
+
+def _ass_line(line: str) -> bool:
+    head = line.lstrip("\ufeff \t")
+    return head.lower().startswith(_ASS_SECTIONS) or bool(_ASS_FIELD.match(head))
+
+
+def repair_ass_header(text: str) -> tuple[str, int, str]:
+    """`(text, banner lines turned into comments, why)`. ASS text that ffmpeg's probe would not open as ASS comes back
+    with `[Script Info]` as its first line and the lines before its first ASS line as `; ` comments below it (a case
+    or space variant of the header line is rewritten, not doubled), in the file's own line breaks. Text the probe
+    opens, text with no ASS content, WebVTT (a first line `WEBVTT`) and an SRT (a line with `-->` before the first ASS
+    line) come back as they are with `why` empty; a banner over `REPAIR_MAX_LINES` comes back as it is with `why`
+    saying so."""
+    head = text[1:] if text.startswith("\ufeff") else text
+    if head.lstrip("\r\n").startswith((_ASS_PROBE, _VTT_PROBE)) or not _ASS_CONTENT.search(text):
+        return text, 0, ""
+    parts = _LINE_BREAK.split(text)             # line, break, line, break, ..., line
+    lines = parts[0::2]
+    first = next((i for i, line in enumerate(lines) if _ass_line(line)), None)
+    if first is None:                           # never: each `_ASS_CONTENT` line is an ASS line; no StopIteration
+        return text, 0, ""
+    banner = lines[:first]
+    written = sum(1 for b in banner if b.strip("\ufeff \t"))
+    if written > REPAIR_MAX_LINES:
+        return text, 0, f"left as it is: {written} lines before the first ASS line (over {REPAIR_MAX_LINES})"
+    if any("-->" in b for b in banner):                 # an SRT whose caption reads `[Events]`
+        return text, 0, ""
+    brk = parts[1] if len(parts) > 1 else "\n"
+    is_header = lines[first].lstrip("\ufeff \t").lower().startswith("[script info]")
+    if not is_header:
+        why = "no [Script Info] line before the file's sections"
+    elif written:
+        why = "the [Script Info] line is not the file's first line"
+    else:
+        why = "the [Script Info] line is not written as the probe reads it (case or leading space)"
+    out = [_ASS_PROBE + (lines[first].lstrip("\ufeff \t")[13:] if is_header else "") + brk]
+    commented = 0
+    for i, line in enumerate(banner):
+        bare = line.strip("\ufeff \t")
+        if bare and not bare.startswith(";"):
+            line, commented = "; " + bare, commented + 1
+        out.append(line.lstrip("\ufeff") + parts[2 * i + 1])
+    out.append("".join(parts[2 * (first + 1 if is_header else first):]))
+    return "".join(out), commented, why
+
+
 # ----------------------------------------------------------------------------- cache layout
 
 def release_dir(info_hash: str | None, anidb_eid=None) -> Path:

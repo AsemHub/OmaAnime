@@ -381,13 +381,52 @@ local function status_text(e)
     return text
 end
 
--- A subset of `playstate.decide`, and deliberately never a larger one: this side may only refuse a
+-- The click's gate. A subset of `playstate.decide`, and deliberately never a larger one: this side may only refuse a
 -- click the CLI would also refuse. Everything else is launched and the CLI decides, because it is
--- the side that can stop the other process.
+-- the side that can stop the other process. What the screen shows is `loading_play`'s.
 local function play_pending()
     local e = play_entry
     if e and e.state == "running" and status_quiet(e) <= ABANDON_AFTER_S then return e end
     return nil
+end
+
+-- Is the entry's `pid` still one of our play processes? `playstate.pid_is_play`, read the same way: `play` (or
+-- `notify-click`, whose click runs a play) is one of its arguments and the CLI's name is in another. Not the bare
+-- `/proc/<pid>`: a zombie keeps that, and a pid handed to something else would hold the screen for good. The kernel
+-- empties a zombie's `cmdline`. One read a second at most, and only for an entry quiet past the gate's 20 s.
+local alive_seen = { pid = 0, at = -1, alive = false }
+local function play_alive(e)
+    local pid = math.floor(tonumber(e and e.pid) or 0)
+    if pid <= 0 then return false end
+    local now = os.time()
+    if alive_seen.pid == pid and alive_seen.at == now then return alive_seen.alive end
+    local play, ours = false, false
+    local f = io.open("/proc/" .. pid .. "/cmdline", "rb")
+    if f then
+        for arg in (f:read("*a") or ""):gmatch("([^%z]*)%z") do
+            if arg == "play" or arg == "notify-click" then play = true end
+            if arg:find("omarchy-anime", 1, true) or arg:find("omarchy_anime", 1, true) then ours = true end
+        end
+        f:close()
+    end
+    alive_seen.pid, alive_seen.at, alive_seen.alive = pid, now, play and ours
+    return alive_seen.alive
+end
+
+-- The play the loading screen stands for: its art, the band's line, the poll's speed. Display only, never the click's
+-- gate. A running entry is believed as `playstate.decide` believes a claim: "a claim whose process is alive keeps it
+-- however slow the play is". The search writes once before its indexers and once after them, and they may take
+-- `indexerTimeoutSeconds` (5-300 s; 55.3 s recorded), so at the gate's 20 s the window went black mid-search.
+-- A play whose process is gone, or an entry with no pid, is believed for the gate's 20 s after its last write.
+-- Also returned, for the log (`draw_art`): the quiet seconds and, past the gate's 20 s only, whether the process is a
+-- play (nil when it was not asked).
+local function loading_play()
+    local e = play_entry
+    if not (e and e.state == "running") then return nil end
+    local quiet = status_quiet(e)
+    if quiet <= ABANDON_AFTER_S then return e, quiet, nil end
+    local alive = play_alive(e)
+    return alive and e or nil, quiet, alive
 end
 
 local function launching()
@@ -427,8 +466,10 @@ end
 -- episode on this player, and nothing of it is drawn over that episode: no loading screen, no band line, not even a
 -- failure's red line. Its one small corner line is all (`background_text`). Once nothing is watched (the episode ended:
 -- auto-next's case) it is drawn as any play is, choices, keys and a failure's screen included.
-local function behind_watched(e)
-    return e ~= nil and e.background == true and not nothing_watched()
+-- `none`: `nothing_watched()` as the caller already read it (`draw_art` logs the value it decided on).
+local function behind_watched(e, none)
+    if none == nil then none = nothing_watched() end
+    return e ~= nil and e.background == true and not none
 end
 
 -- The sentence and one line per choice, in the CLI's own words: "d  Watch the English dub now …".
@@ -471,7 +512,7 @@ local function status_line()
         table.insert(lines, 1, status_text(chosen))
         return table.concat(lines, "\n"), "&HFFFFFF&"
     end
-    local inflight = play_pending()
+    local inflight = loading_play()
     if inflight and not behind_watched(inflight) then return status_text(inflight), "&HFFFFFF&" end
     -- An episode that was ready while nobody watched loaded paused: its line ("Episode 3 is ready. Space plays it.")
     -- for as long as it stays paused.
@@ -516,17 +557,91 @@ end
 -- the one place that decides the size (`thumbs.BACKDROP_W/H`) — so this file never carries a copy
 -- of it and a change there cannot desynchronise this side. The byte count is still checked, since
 -- `overlay-add` would happily draw a half-written or stale buffer as noise.
+-- Without a usable buffer the third value says why, for the log: the file's name only (its folder names the show).
 local function bgra_size_from_name(path)
-    if type(path) ~= "string" then return nil end
+    if type(path) ~= "string" or path == "" then return nil, nil, "no buffer: none named" end
+    local name = path:match("[^/]*$")
     local w, h = path:match("@(%d+)x(%d+)%.bgra$")
-    if not w then return nil end
+    if not w then return nil, nil, "no buffer: " .. name .. " (no size in its name)" end
     w, h = tonumber(w), tonumber(h)
+    local want = w * h * 4
     local f = io.open(path, "rb")
-    if not f then return nil end
+    if not f then return nil, nil, "no buffer: " .. name .. " (expected " .. want .. " bytes, no file)" end
     local size = f:seek("end")
     f:close()
-    if size ~= w * h * 4 then return nil end
+    if size ~= want then
+        return nil, nil, "no buffer: " .. name .. " (expected " .. want .. " bytes, has " .. tostring(size) .. ")"
+    end
     return w, h
+end
+
+-- The loading screen's decision, in the plugin's own log under the play's trace (`omarchy-anime trace <id>`), as the
+-- corner line's is (`log_line`): the `msg.debug` lines beside each arm of `draw_art` reach no one, since mpv runs with
+-- --no-terminal and its output goes to /dev/null. Once per change of what it decided (drawn or cleared, why, the
+-- entry's trace and state), never per tick: the quiet seconds, the two bitmaps and the band's line ride in the data.
+-- Only decisions about a play are logged: drawn, cleared after it was drawn, or a running play left undrawn. A player
+-- starting over an old entry has nothing to say. `seen` is what `draw_art` decided on, never read again here:
+-- `none` (nothing watched), `quiet` and `alive` (`loading_play`'s), `drew` (each bitmap's `ok` or why not) and `dim`.
+-- A running play's screen cleared for one of `LOADING_FAILED`'s reasons is the failure this line exists for: warn.
+-- Its other clears are by design (its file landed, it plays behind the watched episode, no window yet, or its art is
+-- not looked up yet: `art-pending`).
+local LOADING_FAILED = { quiet = true, ["no-art"] = true, ["no-picture"] = true }
+local loading_sig = ""
+local loading_logged_drawn = false
+local function log_loading(why, measured, e, seen)
+    local drawn = art_shown
+    local sig = tostring(drawn) .. "|" .. why .. "|" .. tostring(e and e.trace) .. "|" .. tostring(e and e.state)
+    if sig == loading_sig then return end
+    if not (drawn or loading_logged_drawn or (e and e.state == "running")) then return end
+    loading_sig, loading_logged_drawn = sig, drawn
+    -- The click's two seconds before the CLI's first write: the entry on disk is still another play's.
+    local trace = tostring(e and e.trace or "")
+    if launching() and launched.trace ~= "" and trace ~= launched.trace then trace = launched.trace end
+    local drew = seen.drew or {}
+    local data = { why = why, state = e and e.state, background = e and e.background,
+                   nothing_watched = seen.none, launching = launching(),
+                   backdrop = drew.backdrop == "ok", logo = drew.logo == "ok",
+                   backdrop_reason = drew.backdrop, logo_reason = drew.logo, dim = seen.dim, alive = seen.alive,
+                   line = (status_line()) ~= "" }
+    if seen.quiet then data.quiet = math.floor(seen.quiet) end
+    if measured ~= "" then data.measured = measured end
+    if e and e.trace ~= nil and tostring(e.trace) ~= trace then data.entry_trace = tostring(e.trace) end
+    local level = (not drawn and e and e.state == "running" and LOADING_FAILED[why]) and "warn" or "info"
+    msg[level]("loading screen: " .. (drawn and "drawn" or "cleared") .. " (" .. why
+             .. (measured ~= "" and (" " .. measured) or "") .. ", trace=" .. trace .. " state="
+             .. tostring(e and e.state) .. " backdrop=" .. tostring(data.backdrop) .. " logo=" .. tostring(data.logo)
+             .. " line=" .. tostring(data.line) .. ")")
+    if opts.bin == "" or trace == "" then return end
+    local json, err = utils.format_json(data)
+    if not json then
+        msg.warn("loading screen not logged: " .. tostring(err))
+        return
+    end
+    mp.command_native_async(cli_command({
+        detach = true,
+        head = { opts.bin, "--trace", trace, "log-event" },
+        words = { "player.loading", drawn and "drawn" or "cleared", "--result", why, "--level", level,
+                  "--data", json },
+    }), function(success, result, error)
+        if not success or (type(result) == "table" and (tonumber(result.status) or 0) < 0) then
+            msg.warn("loading screen log-event failed trace=" .. trace .. " error=" .. tostring(error)
+                     .. " status=" .. tostring(type(result) == "table" and result.status))
+        end
+    end)
+end
+
+-- Why a play's screen is not up, in one word and what it measured (`quiet`: `loading_play`'s).
+local function inactive_why(e, quiet)
+    if not e then return "no-entry", "" end
+    if e.state == "running" then
+        local pid = math.floor(tonumber(e.pid) or 0)
+        return "quiet", "quiet=" .. math.floor(quiet or status_quiet(e)) .. "s over " .. ABANDON_AFTER_S .. "s, "
+                        .. (pid > 0 and ("pid " .. pid .. " is not a running play") or "no pid")
+    end
+    if e.state == "failed" then
+        return "hold-over", "age=" .. (os.time() - (tonumber(e.finishedAt) or 0)) .. "s of " .. FAIL_HOLD_S .. "s"
+    end
+    return "not-in-flight", "state=" .. tostring(e.state)
 end
 
 local function clear_art()
@@ -547,13 +662,19 @@ end
 -- argument stringified, which is what `mp.commandv` sends (measured).
 local function draw_art()
     local e = play_entry
+    local none = nothing_watched()
     -- This play's file is already on screen, whatever the entry still says. mpv's own
     -- event is the earlier truth here and the poll must not be allowed to undo it.
-    if e and landed_trace and e.trace == landed_trace then clear_art() return end
+    if e and landed_trace and e.trace == landed_trace then
+        clear_art()
+        log_loading("landed", "", e, { none = none })
+        return
+    end
     -- A play in the background never covers the episode being watched, failed or not.
-    if behind_watched(e) then
+    if behind_watched(e, none) then
         msg.debug("art: nothing to draw (a play in the background, over the episode being watched)")
         clear_art()
+        log_loading("behind-watched", "", e, { none = none })
         return
     end
     -- A held play keeps its loading screen for as long as it holds the choices: it is not a failure, and
@@ -561,8 +682,9 @@ local function draw_art()
     -- one that has ended (auto-next's case) as over an idle player.
     -- The two seconds after a click in the episodes menu count only while nothing is watched: over an episode being
     -- watched, the entry on disk is still another play's, whose picture must not cover it.
-    local active = (play_pending() ~= nil or (launching() and nothing_watched())
-                    or (choice_entry() ~= nil and nothing_watched()))
+    local inflight, quiet, alive = loading_play()
+    local seen = { none = none, quiet = quiet, alive = alive }
+    local active = (inflight ~= nil or (launching() and none) or (choice_entry() ~= nil and none))
         or (e and e.state == "failed" and (os.time() - (tonumber(e.finishedAt) or 0)) < FAIL_HOLD_S)
     local art = active and e and type(e.art) == "table" and e.art or nil
     if not art then
@@ -570,14 +692,26 @@ local function draw_art()
         -- answerable from `--msg-level=omarchy_anime_episodes=debug` alone.
         msg.debug("art: nothing to draw (active=" .. tostring(active)
                   .. " entry=" .. tostring(e ~= nil) .. " art=" .. type(e and e.art)
-                  .. " nothing_watched=" .. tostring(nothing_watched()) .. ")")
+                  .. " nothing_watched=" .. tostring(none) .. ")")
         clear_art()
+        local why, measured = "no-art", ""
+        if not active then why, measured = inactive_why(e, quiet) end
+        log_loading(why, measured, e, seen)
+        return
+    end
+    -- The claim and the play's first stage write `art = {}` before `set_art` has looked the pictures up (which then
+    -- names both, `""` when it found none): not a failure yet. A named but unusable picture is `no-picture` below.
+    if next(art) == nil then
+        clear_art()
+        log_loading("art-pending", "", e, seen)
         return
     end
     local dim = mp.get_property_native("osd-dimensions") or {}
     if not (dim.w and dim.h and dim.h > 0) then
         msg.debug("art: no osd-dimensions yet (w=" .. tostring(dim.w) .. " h=" .. tostring(dim.h) .. ")")
         clear_art()
+        seen.dim = tostring(dim.w) .. "x" .. tostring(dim.h)
+        log_loading("no-dimensions", "", e, seen)
         return
     end
     local k = RES_Y / dim.h                        -- ASS units per pixel, same as scale()
@@ -585,45 +719,54 @@ local function draw_art()
     local band_px = math.floor(band / k + 0.5)
     local dh = dim.h - band_px
     local any = false
-    local bw, bh = bgra_size_from_name(art.backdrop)
+    -- Each bitmap's outcome, for the log: `ok`, or why not (its buffer, the height left, or mpv's answer).
+    local drew = {}
+    seen.drew = drew
+    local function unusable(why) return why or ("dh=" .. dh) end
+    local bw, bh, bwhy = bgra_size_from_name(art.backdrop)
     if bw and dh > 0 then
         -- `mp.commandv` returns nil plus an error string when mpv refuses the command, so both the
         -- pcall's own ok and the command's return are checked (the same rule draw_thumbs follows).
-        local ok, res = pcall(mp.commandv, "overlay-add", BACKDROP_ID, 0, 0, art.backdrop, "0", "bgra",
-                              bw, bh, bw * 4, dim.w, dh)
+        local ok, res, err = pcall(mp.commandv, "overlay-add", BACKDROP_ID, 0, 0, art.backdrop, "0", "bgra",
+                                   bw, bh, bw * 4, dim.w, dh)
         if ok and res then
-            any = true
+            any, drew.backdrop = true, "ok"
         else
+            drew.backdrop = "refused: " .. tostring(ok and err or res)
             msg.debug("art: backdrop refused (ok=" .. tostring(ok) .. " res=" .. tostring(res)
                       .. " " .. bw .. "x" .. bh .. " -> " .. dim.w .. "x" .. dh .. ")")
             pcall(mp.commandv, "overlay-remove", BACKDROP_ID)
         end
     else
+        drew.backdrop = unusable(bwhy)
         msg.debug("art: no usable backdrop buffer (path=" .. tostring(art.backdrop)
                   .. " dh=" .. tostring(dh) .. ")")
         pcall(mp.commandv, "overlay-remove", BACKDROP_ID)
     end
-    local lw, lh = bgra_size_from_name(art.logo)
+    local lw, lh, lwhy = bgra_size_from_name(art.logo)
     if lw and dh > 0 then
         local dw = math.floor(dim.w / 3)
         local ldh = math.floor(dw * lh / lw)
         local x = math.floor((dim.w - dw) / 2)
         local y = math.floor((dh - ldh) / 2)
-        local ok, res = pcall(mp.commandv, "overlay-add", LOGO_ID, x, y, art.logo, "0", "bgra",
-                              lw, lh, lw * 4, dw, ldh)
+        local ok, res, err = pcall(mp.commandv, "overlay-add", LOGO_ID, x, y, art.logo, "0", "bgra",
+                                   lw, lh, lw * 4, dw, ldh)
         if ok and res then
-            any = true
+            any, drew.logo = true, "ok"
         else
+            drew.logo = "refused: " .. tostring(ok and err or res)
             msg.debug("art: logo refused (ok=" .. tostring(ok) .. " res=" .. tostring(res)
                       .. " " .. lw .. "x" .. lh .. " -> " .. dw .. "x" .. ldh .. " at " .. x .. "," .. y .. ")")
             pcall(mp.commandv, "overlay-remove", LOGO_ID)
         end
     else
+        drew.logo = unusable(lwhy)
         msg.debug("art: no usable logo buffer (path=" .. tostring(art.logo)
                   .. " dh=" .. tostring(dh) .. ")")
         pcall(mp.commandv, "overlay-remove", LOGO_ID)
     end
     art_shown = any
+    log_loading(any and "drawn" or "no-picture", "", e, seen)
 end
 
 -- The backdrop leaves the bottom band (LOADING_BAND, plus CHOICE_BAND with the choices) to the text, because bitmaps
@@ -1119,8 +1262,8 @@ end
 -- the tick, at 0.5 s while the line shows (`tick_status`), redraws it then and only then.
 --
 -- How long a running play is believed: playstate.SILENT_AFTER_S, not ABANDON_AFTER_S. The search writes once before
--- its indexers and again after them (up to their 55 s deadline; 18.9 s recorded), so at 20 s the line would go blank
--- mid-search. Display only: the click's gate (`play_pending`) keeps its 20 s.
+-- its indexers and again after them (`indexerTimeoutSeconds`, default 60 s; 55.3 and 55.4 s recorded on 2026-11-01),
+-- so at 20 s the line would go blank mid-search. Display only: the click's gate (`play_pending`) keeps its 20 s.
 local BACKGROUND_TRUST_S = 60
 local line_overlay = nil
 local line_drawn = ""      -- the event as last sent, so a tick costs a string compare
@@ -1437,7 +1580,7 @@ end
 -- The one thing the old code could not do at all: `subprocess … detach=true` returns before the
 -- play has begun and reports nothing about it, so a failed play told the user nothing whatsoever.
 local function announce()
-    local active = play_pending() ~= nil or launching()
+    local active = loading_play() ~= nil or launching()
     local e = play_entry
     if active then
         announced_fail = ""
@@ -1986,7 +2129,7 @@ mp.register_script_message("dump", function()
         -- Which failure's empty window has already been retracted, so "the window was left up
         -- after a failed play" is answerable over IPC rather than from a screenshot.
         hiddenFailTrace = hidden_fail_trace,
-        playPending = play_pending() ~= nil, launching = launching(),
+        playPending = play_pending() ~= nil, loadingPlay = loading_play() ~= nil, launching = launching(),
         statusLine = (status_line()), pollEvery = status_timer and status_timer.timeout or 0,
         -- The background play's corner line, as last drawn ("" when there is none).
         backgroundLine = line_text,
@@ -2119,7 +2262,7 @@ mp.register_event("file-loaded", function()
 end)
 mp.observe_property("idle-active", "bool", function(_, idle)
     -- A failed play that then clears its hold, or a stopped player: nothing to back a screen for.
-    if idle and not (play_pending() or launching()) then draw_art() end
+    if idle and not (loading_play() or launching()) then draw_art() end
     sync_choice_keys()
     -- The play's block sits at the top only while a file is on screen.
     if last_status ~= "" then draw() end

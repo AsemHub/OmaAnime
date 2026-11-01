@@ -27,8 +27,8 @@ from .anizip import airdate, movie_sources, movie_pairs as anizip_movie_pairs, p
 from .core import Http, Log, StageError, cached_json, get_capped, read_token, write_bytes_atomic, write_cache
 from .indexers import SUBTITLE_FORMATS, release_key
 from .score import SERIES_SIMILARITY, parse_title, season_number, series_similarity, sibling_name
-from .subs import (WRITTEN_ENCODING, decode_text, estimate_offset, offset_decision, parse_cues, shift_text,
-                   streaming_source, strip_ass_attachments)
+from .subs import (WRITTEN_ENCODING, decode_text, estimate_offset, offset_decision, parse_cues, repair_ass_header,
+                   shift_text, streaming_source, strip_ass_attachments)
 
 # The offset window for an external subtitle. Measured: an `[PTQ-plumsubs]` BD file for LxL
 # ep 4 sits at +80.15 s, constant; donors keep `subtitleSyncMaxOffset` (60).
@@ -710,9 +710,77 @@ def checked_release_ids(mapping: dict, release_ids: dict | None, *, source: str 
     return release_ids
 
 
+def planned_tmdb_kind(tmdb: int | None, tmdb_from: str, movie: bool, kinds: dict | None, log: Log | None,
+                      imdb: str | None = None, imdb_from: str = "", **context) -> dict:
+    """May ani.zip's TMDB id stand for this entry: `{id, kind, from, index, verdict, reason, imdb, imdb_verdict}`, with
+    one `extsubs.plan tmdb_kind` line. ani.zip's id is a bare number, and for a movie entry often the parent TV
+    series'. `kinds` is `fribb.lookup`'s answer. The verdict: "use" when Fribb files that number under the plan's
+    kind (`movie` for a movie plan, `tv` otherwise), "drop" when under the other kind (no id request carries it, and
+    `show_tie` gets no TMDB id from it), "unknown" when Fribb has no index, no entry, or another number for the entry
+    (the id is used as before), "release" for the playing release's own id (not checked), "none" with no id.
+
+    With the TMDB id dropped, ani.zip's IMDb id (`imdb`, when `imdb_from` is ani.zip) would lead the id step, and a
+    movie given its series' ids carries the series' IMDb id too, which reaches the series' own files.
+    `imdb_verdict`: "use" when Fribb lists it for this entry and no other TV/ONA entry carries it, "drop" otherwise
+    (left out of the plan too), "unknown" with an index written before it carried IMDb ids (used as before); None
+    when the TMDB id was not dropped or there is no ani.zip IMDb id."""
+    want = "movie" if movie else "tv"
+    out = {"id": tmdb, "kind": None, "from": None, "index": (kinds or {}).get("index") or "none", "verdict": "none",
+           "imdb": None, "imdb_verdict": None}
+    imdb_reason = None
+    if not tmdb:
+        reason = "no TMDB id"
+    elif tmdb_from != "ani.zip":
+        out["verdict"], reason = "release", f"the playing release's own id ({tmdb_from}): its kind is not checked"
+    else:
+        entry = (kinds or {}).get("entry") if out["index"] != "none" else None
+        if out["index"] == "none":
+            out["verdict"] = "unknown"
+            reason = f"no TMDB kinds ({(kinds or {}).get('why') or 'none given'}): ani.zip's id is used as before"
+        elif not entry:
+            out["verdict"], reason = "unknown", "Fribb has no TMDB id for this entry: ani.zip's id is used as before"
+        elif tmdb not in entry["ids"]:
+            out["verdict"] = "unknown"
+            reason = (f"Fribb's TMDB id for this entry is {entry['kind']} {entry['ids']}, not ani.zip's {tmdb}: "
+                      f"its kind is not known, so it is used as before")
+        else:
+            out["kind"], out["from"] = entry["kind"], "fribb"
+            whose, word = {"movie": "movie's", "tv": "TV series'"}, {"movie": "movie", "tv": "TV series"}
+            if entry["kind"] == want:
+                out["verdict"], reason = "use", f"Fribb files TMDB {tmdb} as a {whose[want]} id, as the entry is"
+            else:
+                out["verdict"] = "drop"
+                reason = (f"Fribb files TMDB {tmdb} as a {whose[entry['kind']]} id and the entry is a {word[want]}: "
+                          f"no id request carries it and no title-step record is compared with it")
+                if imdb and imdb_from == "ani.zip":
+                    out["imdb"] = imdb
+                    if entry.get("imdb") is None:
+                        out["imdb_verdict"] = "unknown"
+                        imdb_reason = (f"the TMDB kinds on disk predate their IMDb ids: ani.zip's {imdb} is used as "
+                                       f"before")
+                    elif imdb in entry["imdb"]:
+                        out["imdb_verdict"] = "use"
+                        imdb_reason = f"Fribb lists {imdb} for this entry and no TV/ONA entry carries it"
+                    else:
+                        out["imdb_verdict"] = "drop"
+                        imdb_reason = (f"ani.zip's {imdb} is not an IMDb id Fribb gives this entry alone (it is not "
+                                       f"listed for it, or a TV/ONA entry carries it): a series' id would reach the "
+                                       f"series' files, so no id request carries it and no record is compared with it")
+    if log:
+        log.emit("warn" if out["verdict"] == "drop" else "info", "extsubs.plan", "tmdb_kind",
+                 result={"use": "PASS", "drop": "DROP", "unknown": "UNKNOWN"}.get(out["verdict"], "SKIP"),
+                 **context, tmdb=tmdb, ids_from=tmdb_from if tmdb else None, kind=out["kind"] or "unknown",
+                 kind_from=out["from"], want=want, index=out["index"], age_h=(kinds or {}).get("age_h"),
+                 verdict=out["verdict"], reason=reason, imdb=out["imdb"], imdb_verdict=out["imdb_verdict"],
+                 imdb_reason=imdb_reason,
+                 suggest=f"compare https://www.themoviedb.org/{want}/{tmdb} with the entry"
+                 if out["verdict"] == "unknown" and tmdb else None)
+    return {**out, "reason": reason, "imdb_reason": imdb_reason}
+
+
 def episode_plan(mapping: dict, episode: int, variants: list[str], *, release_ids: dict | None = None,
                  ids_source: str = "", anilist_format: str = "", season_year: int | None = None,
-                 log: Log | None = None, anilist_titles=()) -> dict:
+                 log: Log | None = None, anilist_titles=(), tmdb_kind: dict | None = None) -> dict:
     """What to ask the databases for one episode, and what a file may call it.
 
     Ids: the playing release's own show ids first (`release_ids`, from its indexer add-on's `show_ids`;
@@ -726,18 +794,26 @@ def episode_plan(mapping: dict, episode: int, variants: list[str], *, release_id
     for another series is dropped on every path. Movie: ani.zip's `mappings.type` or
     AniList's `anilist_format`; either one saying MOVIE plans the movie search, so neither source can veto
     it. `format_from` keeps both raw values, `movie_from` names the sources that said MOVIE, and a
-    disagreement (one says MOVIE, the other names another format) is logged as a warning.
+    disagreement (one says MOVIE, the other names another format) is logged as a warning. ani.zip's TMDB id is
+    checked against its kind (`tmdb_kind`, `fribb.lookup`'s answer; `planned_tmdb_kind`): one of the other kind is
+    left out of the plan, and without the answer it is used as before.
     """
     source = ids_source or "indexer"
     release_ids = checked_release_ids(mapping, release_ids, source=source, log=log)
     m = (mapping or {}).get("mappings") or {}
     ep = ((mapping or {}).get("episodes") or {}).get(str(episode)) or {}
+    format_from, movie_from = movie_sources(mapping, anilist_format, log, "extsubs.plan", episode=episode)
+    movie = bool(movie_from)
     tmdb, tmdb_from = (release_ids.get("tmdb"), source) if _pos_int(release_ids.get("tmdb")) else \
         (_pos_int(m.get("themoviedb_id")), "ani.zip")
     imdb, imdb_from = (release_ids.get("imdb"), source) if _imdb(release_ids.get("imdb")) else \
         (_imdb(m.get("imdb_id")), "ani.zip")
-    format_from, movie_from = movie_sources(mapping, anilist_format, log, "extsubs.plan", episode=episode)
-    movie = bool(movie_from)
+    kind_check = planned_tmdb_kind(_pos_int(tmdb), tmdb_from, movie, tmdb_kind, log, imdb=imdb, imdb_from=imdb_from,
+                                   episode=episode)
+    if kind_check["verdict"] == "drop":
+        tmdb = None
+    if kind_check["imdb_verdict"] == "drop":
+        imdb = None
     season = ep.get("seasonNumber") if isinstance(ep.get("seasonNumber"), int) else None
     season_episode = _pos_int(ep.get("episodeNumber"))
     numbering = "ani.zip"
@@ -759,6 +835,7 @@ def episode_plan(mapping: dict, episode: int, variants: list[str], *, release_id
                        title_season=title_season, years=years, sequel=sequel)
     return {"episode": episode, "movie": movie, "movie_from": movie_from, "format_from": format_from, "tmdb": _pos_int(tmdb), "imdb": imdb,
             "ids_from": {"tmdb": tmdb_from if tmdb else None, "imdb": imdb_from if imdb else None},
+            "tmdb_kind": kind_check,
             "season": season, "season_episode": season_episode, "absolute": absolute, "numbering": numbering,
             "years": sorted(years), "years_from": years_from, "sequel": target["sequel"],
             "sequel_from": sequel_from if target["sequel"] else None,
@@ -1212,7 +1289,10 @@ def search(http: Http, log: Log, plan: dict, lang: str, *, playing_title: str = 
     log.info("extsubs.search", "start", episode=plan["episode"], lang=lang,
              codes={svc: service_codes(lang, svc) for svc in services}, movie=plan["movie"],
              movie_from=plan.get("movie_from"), format_from=plan.get("format_from"),
-             tmdb=plan["tmdb"], imdb=plan["imdb"], ids_from=plan["ids_from"], season=plan["season"],
+             tmdb=plan["tmdb"], imdb=plan["imdb"], ids_from=plan["ids_from"],
+             tmdb_kind={k: v for k, v in (plan.get("tmdb_kind") or {}).items()
+                        if k not in ("reason", "imdb_reason")} or None,
+             season=plan["season"],
              season_episode=plan["season_episode"], absolute=plan["absolute"], numbering=plan["numbering"],
              years=plan.get("years"), years_from=plan.get("years_from"), sequel=plan.get("sequel"),
              sequel_from=plan.get("sequel_from"),
@@ -1439,6 +1519,20 @@ def download(http: Http, log: Log, cand: dict, plan: dict, tokens: dict, lang: s
         return None
 
 
+def _repaired(log: Log, cand: dict, text: str, *, cached: bool) -> str:
+    """`subs.repair_ass_header`'s text, with one line when it moved a banner or left one alone."""
+    out, commented, why = repair_ass_header(text)
+    if out != text:
+        log.info("extsubs.download", "repair", result="PASS", service=cand["service"], file_id=cand["file_id"],
+                 commented=commented, why=why, cached=cached,
+                 suggest="ffmpeg's ass probe needs [Script Info] first; the lines before the file's first ASS line "
+                         "are kept as comments below it")
+    elif why:
+        log.warn("extsubs.download", "repair", result="SKIP", service=cand["service"], file_id=cand["file_id"],
+                 why=why, cached=cached, suggest="mpv may refuse this file; a dropped twin is tried if it does")
+    return out
+
+
 def _download(http: Http, log: Log, cand: dict, plan: dict, tokens: dict, lang: str | None) -> dict | None:
     """`download`'s body, which may raise; `download` turns anything but ServiceSkipped into None."""
     t0 = time.monotonic()
@@ -1448,6 +1542,15 @@ def _download(http: Http, log: Log, cand: dict, plan: dict, tokens: dict, lang: 
         if path.exists() and path.stat().st_size > 0:
             text, _ = decode_text(path.read_bytes(), lang, log, service=cand["service"], file_id=cand["file_id"],
                                   path=str(path))
+            fixed = _repaired(log, cand, text, cached=True)
+            if fixed != text:                           # a copy an older build wrote is the one mpv gets
+                try:
+                    write_bytes_atomic(path, fixed.encode(WRITTEN_ENCODING))
+                    text = fixed
+                except OSError as exc:
+                    log.warn("extsubs.download", "repair_write", result="FAIL", service=cand["service"],
+                             file_id=cand["file_id"], path=str(path), error=str(exc),
+                             suggest="the cached copy stays as it was; mpv may refuse it and a twin is tried")
             cues = parse_cues(text, guess.upper(), log, str(path))
             log.debug("extsubs.download", "cache", result="HIT", service=cand["service"], file_id=cand["file_id"])
             return {"path": str(path), "text": text, "format": guess, "cues": cues, "cached": True}
@@ -1478,7 +1581,7 @@ def _download(http: Http, log: Log, cand: dict, plan: dict, tokens: dict, lang: 
                  suggest="the next candidate is tried instead")
         return None
     text, encoding = decode_text(blob, lang, log, service=cand["service"], file_id=cand["file_id"], name=name)
-    text, cut, removed = strip_ass_attachments(text)
+    text, cut, removed = strip_ass_attachments(_repaired(log, cand, text, cached=False))
     if cut:
         log.warn("extsubs.download", "strip", result="WARN", service=cand["service"], file_id=cand["file_id"],
                  sections=cut, chars_removed=removed,
@@ -1546,9 +1649,15 @@ def _title_step_ties(cands) -> list[dict]:
 def _search_cached(http: Http, log: Log, plan: dict, lang: str, anilist_id: int, playing_title: str,
                    tokens: dict | None) -> dict:
     """`search`, cached 24 h per (show, episode, language). Ranking is recomputed from the cached
-    candidates, because it depends on the playing release."""
+    candidates, because it depends on the playing release. An answer names the ids it was searched with (`ids`); one
+    searched with other ids (a TMDB id the kinds have since left out) is searched again."""
     path = search_cache_path(anilist_id, plan["episode"], lang)
     hit = cached_json(path, SEARCH_TTL_S)
+    ids = {"tmdb": plan.get("tmdb"), "imdb": plan.get("imdb")}
+    if isinstance(hit, dict) and isinstance(hit.get("ids"), dict) and hit["ids"] != ids:
+        log.info("extsubs.search", "cache", result="STALE", path=str(path), cached_ids=hit["ids"], ids=ids,
+                 reason="the answer was searched with other ids than this plan's: searched again")
+        hit = None
     stale = [c.get("name") for c in (hit or {}).get("candidates") or [] if isinstance(c, dict)
              and c.get("step") == "title" and "show_tie" not in c] if isinstance(hit, dict) else []
     if stale:
@@ -1569,7 +1678,8 @@ def _search_cached(http: Http, log: Log, plan: dict, lang: str, anilist_id: int,
     if all(r["status"] in ("ok", "no key") for r in found["services"].values()):
         try:
             write_cache(path, {"candidates": [{k: v for k, v in c.items() if k not in ("affinity", "affinity_why")}
-                                              for c in found["candidates"]], "services": services})
+                                              for c in found["candidates"]], "services": services,
+                               "ids": ids})
         except OSError as exc:                          # a full disk costs the cache, not the search
             log.warn("extsubs.search", "cache_write", result="FAIL", path=str(path), error=str(exc),
                      suggest="the search is used this play and asked again next play")
@@ -1622,7 +1732,11 @@ def prepare(http: Http, log: Log, plan: dict, lang: str, anilist_id: int, *, pla
         cues = [a for a, _ in got["cues"]]
         twin = next((h for h in have if same_file(cues, h["cue_starts"], log)), None)
         if twin:
-            # Files are tried in rank order, so the copy already kept is the better-ranked one.
+            # Files are tried in rank order, so the copy already kept is the better-ranked one. Each copy passed
+            # `subs.repair_ass_header` at its write or cache read, so a kept ASS copy has the header ffmpeg's probe
+            # needs (unless the repair left it: a banner over 20 lines or one with `-->`); one the player still
+            # refuses falls back to the copies dropped here (`load_into_player`).
+            twin.setdefault("twins", []).append(_twin(cand, got))
             log.info("extsubs.dedupe", "same", result="PASS", dropped=cand["name"], kept=twin["name"],
                      dropped_service=cand["service"], kept_service=twin["service"])
             continue
@@ -1641,6 +1755,13 @@ def prepare(http: Http, log: Log, plan: dict, lang: str, anilist_id: int, *, pla
     return {"tracks": [{k: v for k, v in t.items() if k not in ("text", "cue_starts")} for t in tracks],
             "candidates": found["candidates"], "services": found["services"], "downloads": downloads,
             "skipped": skipped}
+
+
+def _twin(cand: dict, got: dict) -> dict:
+    """A copy the dedupe dropped, as `load_into_player` adds it when the kept copy fails: its cached file, unshifted
+    and unverified (`same_file` aligns copies up to 180 s apart, so the kept copy's offset is not this one's)."""
+    return {**cand, "path": got["path"], "raw_path": got["path"], "file_format": got["format"], "offset": 0.0,
+            "timing_verified": None, "reason": "a twin of a file the player refused; not timed"}
 
 
 def _placed(log: Log, anilist_id: int, episode: int, lang: str, t: dict) -> str:
@@ -1809,14 +1930,16 @@ def still_playing(expect: dict, mpv=None) -> dict:
 
 
 def load_into_player(log: Log, mpv, tracks: list[dict], lang: str, expect: dict, plugin_sid,
-                     may_replace: bool) -> dict:
+                     may_replace: bool, verified_only: bool = False) -> dict:
     """Add the tracks to the running player, best first. The best is selected only when the
     viewer has not picked a track since the plugin set one (`plugin_sid`) and either nothing in the
     language is on or `may_replace` (what is on is an unverified donor and the best file is verified), and never
     when nothing ties it to the entry's show (`untied`: a title search also finds other shows): such a file is
-    added for the viewer to choose (`offered`). Checks the episode before every `sub-add`. Never raises; returns what
-    happened."""
-    out = {"added": [], "selected": None, "stopped": None, "offered": None}
+    added for the viewer to choose (`offered`). A file the player refuses is replaced by a copy the dedupe dropped
+    (`_sub_add`). `verified_only`: `may_replace` was earned by the best file's verified timing (an unverified donor is
+    on), so a file selected in its place must be verified too; an untimed twin is then added, not selected. Checks the
+    episode before every `sub-add`. Never raises; returns what happened."""
+    out = {"added": [], "selected": None, "stopped": None, "offered": None, "twin": None}
     try:
         now_sid = mpv.command("get_property", "sid")
     except (StageError, OSError) as exc:                # a player that quit resets the socket (OSError)
@@ -1826,23 +1949,17 @@ def load_into_player(log: Log, mpv, tracks: list[dict], lang: str, expect: dict,
         return out
     viewer_chose = str(now_sid) != str(plugin_sid)
     for i, t in enumerate(tracks):
-        check = still_playing(expect, mpv)
-        if not check["playing"]:
-            out["stopped"] = "another episode is playing"
-            log.info("extsubs.load", "stop", result="SKIP", reason=out["stopped"], added=len(out["added"]),
-                     by=check["by"], why=check["reason"], stamp=check["stamp"])
+        if _stopped(log, mpv, expect, out):
             break
-        select = i == 0 and not viewer_chose and may_replace
-        if select and untied(t):
-            select = False
-            out["offered"] = f"found by title only: {t.get('show_tie_why') or 'nothing ties it to the show'}"
-        title = track_title(lang, t)
-        try:
-            mpv.command("sub-add", t["path"], "select" if select else "auto", title, lang)
-        except (StageError, OSError) as exc:
-            log.warn("extsubs.load", "sub-add", result="FAIL", path=t["path"], error=str(exc))
+        got, f = _sub_add(log, mpv, t, lang, i == 0 and not viewer_chose and may_replace, expect, out, verified_only)
+        if got is None:
+            if out["stopped"]:
+                break
             continue
-        out["added"].append({"title": title, "path": t["path"], "selected": select})
+        if i == 0 and f is not t:
+            out["twin"] = f                             # the popout describes the file that loaded
+        select, title = got["selected"], got["title"]
+        out["added"].append(got)
         if select:
             readback = {}
             for key in ("lang", "external", "title"):
@@ -1856,9 +1973,60 @@ def load_into_player(log: Log, mpv, tracks: list[dict], lang: str, expect: dict,
                      title=title, readback=readback)
     log.info("extsubs.load", "done", result="PASS" if out["added"] else "EMPTY", added=[a["title"] for a in out["added"]],
              selected=out["selected"], viewer_chose=viewer_chose, plugin_sid=plugin_sid, sid_now=now_sid,
-             may_replace=may_replace, stopped=out["stopped"], offered=out["offered"],
+             may_replace=may_replace, verified_only=verified_only, stopped=out["stopped"], offered=out["offered"],
              untied=sum(1 for t in tracks if untied(t)), untied_why=_title_step_ties(t for t in tracks if untied(t)))
     return out
+
+
+def _stopped(log: Log, mpv, expect: dict, out: dict) -> bool:
+    """Before a `sub-add`: True (with `out["stopped"]` and one `extsubs.load stop` line) once another episode plays."""
+    check = still_playing(expect, mpv)
+    if check["playing"]:
+        return False
+    out["stopped"] = "another episode is playing"
+    log.info("extsubs.load", "stop", result="SKIP", reason=out["stopped"], added=len(out["added"]),
+             by=check["by"], why=check["reason"], stamp=check["stamp"])
+    return True
+
+
+def _sub_add(log: Log, mpv, t: dict, lang: str, best: bool, expect: dict, out: dict,
+             verified_only: bool = False) -> tuple[dict | None, dict]:
+    """`sub-add` of `t`, else of each copy of it the dedupe dropped (`twins`), in order (a live play: mpv refused a kept
+    copy whose twin it opens). The best file is selected unless nothing ties it to the show (`untied`, then it is
+    `offered`: set as for `t`, then for the twin that loaded), or `verified_only` and its timing is not verified.
+    Returns `({title, path, selected}, the file added)`, or `(None, t)`: nothing added, `out["stopped"]` set if the
+    episode changed before a twin's turn. One `extsubs.load twin` line per twin tried."""
+    for n, f in enumerate([t, *(t.get("twins") or [])]):
+        if n:
+            if _stopped(log, mpv, expect, out):
+                return None, t
+        select = best and not untied(f) and (not verified_only or f.get("timing_verified") is True)
+        offered = f"found by title only: {f.get('show_tie_why') or 'nothing ties it to the show'}" \
+            if best and untied(f) else None
+        if not n and offered:
+            out["offered"] = offered
+        title = track_title(lang, f)
+        try:
+            mpv.command("sub-add", f["path"], "select" if select else "auto", title, lang)
+        except (StageError, OSError) as exc:
+            if n:
+                log.warn("extsubs.load", "twin", result="FAIL", path=f["path"], name=f.get("name"),
+                         instead_of=t.get("name"), error=str(exc))
+            else:
+                log.warn("extsubs.load", "sub-add", result="FAIL", path=f["path"], error=str(exc),
+                         twins=len(t.get("twins") or []))
+            continue
+        if n:
+            held = None if select else ("not the file to turn on (the viewer chose a track, or another is better)"
+                                        if not best else "nothing ties it to the show" if untied(f)
+                                        else "verified_only: an unverified donor is on and this twin is not timed")
+            log.info("extsubs.load", "twin", result="PASS", path=f["path"], name=f.get("name"),
+                     instead_of=t.get("name"), refused=t["path"], title=title, selected=select,
+                     verified_only=verified_only, held=held)
+            if best:
+                out["offered"] = offered
+        return {"title": title, "path": f["path"], "selected": select}, f
+    return None, t
 
 
 def update_now_playing(log: Log, expect: dict, lang: str, tracks: list[dict], loaded: dict, mpv=None) -> bool:
@@ -1873,7 +2041,7 @@ def update_now_playing(log: Log, expect: dict, lang: str, tracks: list[dict], lo
         log.info("nowplaying", "external", result="SKIP", by=check["by"], why=check["reason"], stamp=check["stamp"],
                  suggest="the badge is not written: another file is playing")
         return False
-    best = tracks[0]
+    best = loaded.get("twin") or tracks[0]
     np = read_now_playing() or {}
     if offered:
         # Only the line: what is on (nothing, or what the play chose) stays as the play wrote it.
@@ -1900,14 +2068,15 @@ def update_now_playing(log: Log, expect: dict, lang: str, tracks: list[dict], lo
 
 def require_lookup(http: Http, log: Log, mapping: dict, episode: int, variants: list[str], lang: str,
                    anilist_id: int, playing_title: str = "", season_year: int | None = None,
-                   anilist_format: str = "", anilist_titles=()) -> dict | None:
+                   anilist_format: str = "", anilist_titles=(), tmdb_kind: dict | None = None) -> dict | None:
     """Under `subtitlePolicy=require` with no donor: does a subtitle database have a file that fits this
     episode? Search only (cached 24 h, shared with the play's worker), nothing downloaded. Never raises.
-    `season_year` and `anilist_format` come from the titles cache, as they do for the worker's plan. A file nothing
+    `season_year` and `anilist_format` come from the titles cache, as they do for the worker's plan; `tmdb_kind`
+    from the TMDB kinds on disk (`fribb.lookup` without a refresh: this runs in the resolve). A file nothing
     ties to the entry's show (`untied`) is not one: the worker would never turn it on."""
     try:
         plan = episode_plan(mapping, episode, variants, season_year=season_year, anilist_format=anilist_format,
-                            log=log, anilist_titles=anilist_titles)
+                            log=log, anilist_titles=anilist_titles, tmdb_kind=tmdb_kind)
         found = _search_cached(http, log, plan, lang, anilist_id, playing_title, None)
     except Exception as exc:                          # noqa: BLE001 - a failed lookup reads as "none found"
         log.warn("extsubs.require", "lookup", result="FAIL", error=f"{type(exc).__name__}: {exc}")

@@ -171,7 +171,8 @@ up on its own. `omarchy-anime trace last` shows the decision as a `provider.bloc
 provider, how many refusals it took and what they cost.
 
 Releases come from the indexer add-ons you installed; the plugin ships none. Episode numbering comes
-from `api.ani.zip`. The plugin reads them, it does not upload anything.
+from `api.ani.zip`, and whether a show's TMDB id is a movie's or a TV series' from Fribb's anime-lists on GitHub. The
+plugin reads them, it does not upload anything.
 
 ## Uninstall
 

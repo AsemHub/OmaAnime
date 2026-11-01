@@ -28,6 +28,7 @@ from pathlib import Path
 from .core import *  # noqa: F401,F403
 from .anizip import airdate, anizip_mappings, episode_ids, movie_sources
 from . import anizip
+from . import fribb
 from . import anilist as anilistmod
 from .score import parse_title, has_language, rank_candidates, score_candidate, pack_range_excludes, pack_ranges
 from .score import audio_dub, dub_reading, original_audio
@@ -2482,8 +2483,10 @@ def _resolve(args, log: Log, settings: dict, dry_run: bool, ranked_sink: list | 
                                                         "seeders", "track_id", "forced", "anchor_lang",
                                                         "format")}}, scan["examined"]
         # A chosen variant asks the databases for its own code, as the play's worker will.
+        # The TMDB kinds on disk only: this runs in the resolve, so nothing is fetched here (the worker does).
         external = extsubs.require_lookup(http, log, mapping, args.episode, variants, setting_variant(settings) or lang,
-                                          args.anilist_id, target.get("title") or "", **plan_hints(args.anilist_id))
+                                          args.anilist_id, target.get("title") or "", **plan_hints(args.anilist_id),
+                                          tmdb_kind=fribb.lookup(None, log, args.anilist_id, refresh_due=False))
         if external:
             # A matching file found by search in a subtitle database is enough; the
             # play's worker downloads and loads it.
@@ -5201,8 +5204,12 @@ def do_subs_external(args, log: Log, settings: dict) -> dict:
         return loaded[0]
 
     release_ids, ids_source = playing_show_ids(http, log, settings, args.release_id, registry)
+    # The kind of ani.zip's TMDB id (a movie's is often its series'); this command runs after the play started, so a
+    # week-old list is fetched again here, and only when ani.zip has a TMDB id to check.
+    kinds = fribb.lookup(http, log, args.anilist_id,
+                         refresh_due=bool(anizip.pos_int(((mapping or {}).get("mappings") or {}).get("themoviedb_id"))))
     plan = extsubs.episode_plan(mapping, args.episode, variants, release_ids=release_ids, ids_source=ids_source,
-                                log=log, **plan_hints(args.anilist_id))
+                                log=log, **plan_hints(args.anilist_id), tmdb_kind=kinds)
     if args.load:
         return subs_external_load(args, log, http, plan, lang, settings, registry)
     if args.fetch:
@@ -5319,7 +5326,8 @@ def subs_external_load(args, log: Log, http: Http, plan: dict, lang: str, settin
         log.warn("extsubs.worker", "mpv", result="FAIL", suggest="the player is gone; nothing to load into")
         return {**out, "loaded": None}
     may_replace = bool(args.nothing_on) or (bool(args.donor_unverified) and tracks[0].get("timing_verified") is True)
-    loaded = extsubs.load_into_player(log, mpv, tracks, lang, expect, args.sid, may_replace)
+    loaded = extsubs.load_into_player(log, mpv, tracks, lang, expect, args.sid, may_replace,
+                                      verified_only=not args.nothing_on)
     out["loaded"] = loaded
     out["now_playing"] = extsubs.update_now_playing(log, expect, lang, tracks, loaded, mpv)
     return out

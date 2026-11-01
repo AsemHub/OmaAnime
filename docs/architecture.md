@@ -40,6 +40,7 @@ Omarchy shell (Quickshell)                      Python CLI (standard library onl
 | `cli.py` | the commands and the play pipeline |
 | `anilist.py` | AniList GraphQL: lists, search, media, progress writes, the rate-limit pacing |
 | `anizip.py` | ani.zip: an AniList id to AniDB/TVDB/TMDB ids and per-episode numbering |
+| `fribb.py` | Fribb's anime-lists: whether a show's TMDB id is a movie's or a TV series', fetched weekly by the subtitle worker into a small index |
 | `indexers.py` | loading indexer add-ons, the guarded call, the query objects and capability handles |
 | `addon_help.py` | the add-on interface (`addons spec`) and the two AI agent prompts (`addons prompt`), from one place the tables, example and prompts of [addons.md](addons.md) are checked against |
 | `addon_check.py` | `addons check`: one add-on file loaded as the registry would and asked once, offline (every request answered with `ctx.HttpError`, a connection of its own through the usual socket calls refused: a check, not a sandbox) or `--live` |
@@ -117,6 +118,7 @@ the wrong type is logged and skipped, never the play itself. The interface is do
 | What you watch, and your progress | AniList | the `anilist/` caches, the queue of progress writes not yet sent |
 | The shows around a later season (a first season: only when a release name states a part its titles do not) | AniList | `anilist/franchise/` (8 days; a day while a related show's count is not known or none is related; up to 30 days while AniList cannot be read) |
 | Episode numbering and cross-site ids | ani.zip | `mappings/` |
+| Whether a TMDB id is a movie's or a TV series' | Fribb's anime-lists | `tmdb-kinds.json` (a week; an older one is used while a refresh fails) |
 | Releases for an episode | your indexer add-ons | `searches/` (the last search, for the release list) |
 | Whether a provider has a release | the provider | nothing lasting; a refusal is remembered for `providerBlockMinutes` |
 | Settings | `shell.json` entry, then `config.json`, then the defaults | none |
