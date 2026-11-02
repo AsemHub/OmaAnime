@@ -1209,6 +1209,13 @@ def episode_search(ctx, query, sources: list[Source]) -> list[dict]:
     franchise_kept: list = []                           # [name, words, why] of each kept near-match
     ova_drops: list = []                                # [name, why] of each OVA a TV series dropped
 
+    def pack_row(pack_by: str, title: str) -> list:
+        """`[pack_by, name]` of a kept pack, and, when the own-season words rule read it (it states the entry's own
+        season, for a later season), why it stayed and the words it read (`query.own_season_reading`)."""
+        own = getattr(query, "own_season_reading", None)
+        reading = own(title) if own else None
+        return [pack_by, title, *([reading.why, list(reading.words)] if reading is not None else [])]
+
     def keep(rel):
         """(keep, code, why). `query.matches` first; a movie's release and a pack on the pack pass that fail
         it on the episode alone are asked again without the episode test (the same show and season rule,
@@ -1237,7 +1244,7 @@ def episode_search(ctx, query, sources: list[Source]) -> list[dict]:
                 franchise_kept.append([rel["title"], sorted(reading.words), reading.why])
         if ok:
             if pack_by:
-                packs.append([pack_by, rel["title"]])
+                packs.append(pack_row(pack_by, rel["title"]))
                 why = f"pack ({pack_by})"           # every kept pack says what made it one
             return True, "unnumbered" if code == "single_episode" else "ok", why
         if code == "episode" and (movie or query.pack_pass):
@@ -1249,12 +1256,17 @@ def episode_search(ctx, query, sources: list[Source]) -> list[dict]:
                 if reason:
                     return False, "movie_episode", reason
             # The franchise reading was once asked here of a `Part 3 - 01` single read as a pack.
-            # It is no pack now, and the pack pass leaves it above. No pack this retry
-            # keeps can be another show's: a season pack states the entry's own season and only parts its titles state,
-            # so `query.franchise_reading` keeps it (`score.states_own_season`), and a range pack is not read.
+            # It is no pack now, and the pack pass leaves it above. A season pack states the entry's own season and
+            # only parts its titles state, so the franchise reading's exact title and part never drop it; the
+            # own-season words rule still does, when it adds a word before its season statement (`Show Driftwood 2nd
+            # Season [Batch]`) or, on a TV series, another year.
+            own_season = getattr(query, "own_season_reason", None)
+            reason = own_season(rel["title"]) if ok and query.pack_pass and own_season else ""
+            if reason:
+                return False, score.FRANCHISE_SHOW, reason
             if ok:
                 if pack_by:
-                    packs.append([pack_by, rel["title"]])
+                    packs.append(pack_row(pack_by, rel["title"]))
                 return True, "unnumbered", "movie" if movie else f"pack ({pack_by})"
             return False, why.split()[0], why
         return False, code, why
@@ -1264,7 +1276,7 @@ def episode_search(ctx, query, sources: list[Source]) -> list[dict]:
         # Which pattern made each kept title a pack, in one line after the feeds.
         seen = list({p[1]: p for p in list(packs)}.values())
         by: dict[str, int] = {}
-        for pack_by, _ in seen:
+        for pack_by, *_ in seen:
             kind = pack_by.split(":")[0]
             by[kind] = by.get(kind, 0) + 1
         ctx.log.info(COMPONENT, "packs", result="PASS" if seen else "EMPTY", episode=query.episode,
@@ -1272,7 +1284,8 @@ def episode_search(ctx, query, sources: list[Source]) -> list[dict]:
                      more=max(0, len(seen) - PACK_NAMES_LOGGED),
                      reason="a title is a pack when it says batch or names a range, or when it states the "
                             "entry's own season and no episode; season packs are read only when the entry's titles "
-                            "state a season")
+                            "state a season; a pack the own-season words rule read carries why it stayed and the words "
+                            "it read before its season statement")
     if single and not query.pack_pass:
         # Why each name of a one-episode entry was kept or dropped, in one line after the feeds.
         seen = list({r[0]: r for r in list(readings)}.values())

@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from .core import CACHE_DIR, Log, StageError, cached_json, write_cache
-from .score import pack_ranges, parse_title, sibling_name
+from .score import guard_reading, pack_ranges, parse_title, sibling_name
 from . import say as saymod
 
 SEARCH_TTL = 30 * 60          # the picker reuses a search younger than this
@@ -86,15 +86,22 @@ class Search:
         gone = {r["info_hash"] for r in self.rejected}
         self.passed = [row(c, variants=self.variants, movie=self.movie) for c in ranked if _hash(c) not in gone]
 
-    def mark_other_shows(self, ranked: list[dict], variants: list[str], movie: bool | None = None) -> int:
+    def mark_other_shows(self, ranked: list[dict], variants: list[str], movie: bool | None = None,
+                         own=None) -> int:
         """The franchise refusal names the franchise as a whole; the picker names each release's show. A refused
-        movie's own releases (no episode marker) are not another show."""
+        movie's own releases (no episode marker) are not another show. With the entry's titles (`own`), the show is
+        the guard's reading (`guard_reading`), so a row is another show only by a name the guard counted, and is
+        labelled by it (`S1 - Vol 1-9` was "another show: Vol", a word the guard sets aside). The count of
+        rows marked."""
         movie = self.movie if movie is None else movie
         n = 0
         for cand in ranked:
-            name = sibling_name(cand.get("title", ""), variants, movie)
+            title = cand.get("title", "")
+            name = guard_reading(title, variants, movie, own)[0] if own is not None else sibling_name(title, variants,
+                                                                                                       movie)
             if name:
                 self.reject(cand, "other_show", name)
+                self.rejected[-1]["show"] = name.title()
                 n += 1
         return n
 

@@ -289,6 +289,13 @@ class EpisodeQuery:
     # says TV or TV_SHORT, and neither names another format), neither a movie nor a one-episode entry. Its episode is
     # no OVA: the show test drops a single stating one before its marker (`score.ova_entry_reason`). Added last.
     tv_series: bool = False
+    # For a TV series, the year AniList says it started (`cli.entry_years`), or None: with `franchise_shows`, a name
+    # stating the entry's own season that gives its series a year after the entry's last year is another show
+    # (`own_season_reason`). Added last.
+    start_year: int | None = None
+    # For a TV series, the year AniList says it ended (`endDate`), or None (still airing, or not known yet): the
+    # entry's last year, else `start_year + 1` (`score.later_series_years`). Added last.
+    end_year: int | None = None
 
     def matches(self, title: str) -> tuple[bool, str]:
         """For a movie, a title that passes and states an episode other than `movie_pairs` is dropped
@@ -305,7 +312,11 @@ class EpisodeQuery:
         are exactly another show's title is dropped (`franchise_show …`, `score.franchise_show_reason`): the first cour's
         `[Grp] Tidewater Lantern - 01` for `Tidewater Lantern 2`, which names no season the season test could read.
         Not asked of a name that states the entry's own season (`- 01 [S2]`, `- 01 (2nd
-        Season)` for a season-2 entry), which the season test has already agreed with.
+        Season)` for a season-2 entry), which the season test has already agreed with. Such a name is asked the
+        own-season words rule instead (`own_season_reason`): one that writes a word none of the entry's titles hold
+        before its season statement (`[Grp] Tidewater Lantern Driftwood 2nd Season - 01` for `Tidewater Lantern 2nd
+        Season`), or, for a TV series, gives its series a year other than the entry's start, is another show's
+        (`franchise_show …`). A range pack is asked it too.
 
         For an entry ani.zip files as TVDB's first season (`first_season`), whose titles state none, a
         kept single that states season 2 or later is dropped with `season N wanted 1 (…)` (the
@@ -436,8 +447,10 @@ class EpisodeQuery:
 
     def franchise_reading(self, title: str, parts_only: bool = False):
         """`score.franchise_reading` of a name for this entry, or None when the rule is not asked (no
-        `franchise_shows`, a movie, a one-episode entry, a pack). A name stating the entry's own season
-        is kept with that reason, and every kept reading says why.
+        `franchise_shows`, a movie, a one-episode entry, a range pack the own-season words rule keeps). A name
+        stating the entry's own season is read by that rule alone (`own_season_reading`): dropped when it adds a
+        word before its season statement (or, on a TV series, another year), else kept with both reasons. Every
+        kept reading says why.
 
         A single named `Part 2 - 10` is read (`score.pack_range_search`, which `is_pack` reads through
         too), and the entry's every title (`titles`) is handed to the part reading. A name stating the entry's own
@@ -447,15 +460,43 @@ class EpisodeQuery:
         `parts_only` (the plugin's own reading of a first season's names, `cli.first_season_parts`) asks
         the part reading alone (`exact=False`); an add-on's `matches` never does. The part is
         read before the episode marker only (`score.stated_parts`)."""
-        from .score import franchise_reading, franchise_words, pack_range_search, states_own_season, FranchiseReading
-        if not self.franchise_shows or self.movie or self.single_episode or pack_range_search(title):
+        from .score import franchise_reading, franchise_words, pack_range_search, FranchiseReading
+        if not self.franchise_shows or self.movie or self.single_episode:
             return None
-        if states_own_season(title, self.season, (*self.variants, *self.titles), self.franchise_shows, self.episode,
-                             self.alt_numbers):
+        if pack_range_search(title):
+            # A range pack is read by the own-season words rule alone (`own_season_reason`), as the pack pass reads it.
+            reason = self.own_season_reason(title)
+            return FranchiseReading(reason, frozenset(), "", True) if reason else None
+        own = self.own_season_reading(title)
+        if own is not None:
             words = franchise_words(title, self.episode, self.alt_numbers)[0]
-            return FranchiseReading(None, words, f"states the entry's own season {self.season}", bool(words))
+            if own.reason:
+                return FranchiseReading(own.reason, words, "", True)
+            return FranchiseReading(None, words, f"states the entry's own season {self.season}; {own.why}", bool(words))
         return franchise_reading(title, self.variants, self.franchise_shows, self.episode, self.alt_numbers,
                                  self.titles, exact=not parts_only)
+
+    def own_season_reading(self, title: str) -> "score.OwnSeasonReading | None":
+        """`score.own_season_reading` of a name stating the entry's own season (`score.states_own_season`), or None
+        when it is not asked: no `franchise_shows` (not a later season, or AniList's answer could not be read), a movie
+        or a one-episode entry, or a name stating no season or another. The year is asked only of a TV series
+        (`tv_series`, `start_year`, `end_year`). The one reading `franchise_reading` (singles, and a range pack on
+        `matches`), the built-in Torznab add-on's pack pass and `cli.pack_pass_show_check` (every add-on's pack-pass
+        records) ask."""
+        from .score import own_season_reading, states_own_season
+        if not self.franchise_shows or self.movie or self.single_episode:
+            return None
+        own = (*self.variants, *self.titles)
+        if not states_own_season(title, self.season, own, self.franchise_shows, self.episode, self.alt_numbers):
+            return None
+        return own_season_reading(title, own, self.episode, self.alt_numbers, self.start_year, self.tv_series,
+                                  self.end_year)
+
+    def own_season_reason(self, title: str) -> str:
+        """`own_season_reading`'s drop reason (starting `franchise_show`), or "" when it keeps the name or is not
+        asked."""
+        reading = self.own_season_reading(title)
+        return (reading.reason or "") if reading is not None else ""
 
     def part_kept(self, title: str, indexer: str | None = None, pack_pass: bool | None = None,
                   parts_only: bool = False) -> str:

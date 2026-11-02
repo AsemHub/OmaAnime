@@ -45,10 +45,12 @@ from .indexers import release_key
 from .score import (title_matches_episode, record_group_langs, propagate_verification, pick_episode_file,
                     load_group_stats, static_group_priors, order_ranked, group_stats_report, backfill_group_stats,
                     season_number, sibling_names, sibling_reading, AMBIGUOUS_SIBLINGS, movie_episode_reason,
-                    guard_reading, sibling_name,
+                    guard_reading, sibling_name, multi_show_pack, set_aside_words,
                     skipped_summary, title_numbers, title_episode_log, FRANCHISE_SHOW, FILE_NUMBER_NOT_EPISODE,
                     FILE_SEASON_RELATIVE, FIRST_SEASON_TAG, COMPILATION_FILM, compilation_film_reading, OTHER_ENTRY_TAG,
                     spelling_reading, FRANCHISE_PART_TAG, extra_parts, title_parts, FIRST_SEASON_EXACT,
+                    first_season_added_words, first_season_show_pack, FIRST_SEASON_SHOW_TAG, franchise_reading,
+                    PACK_EXEMPT_PART, pack_range_search, marked_show,
                     guard_reads_drop, GUARD_DROP_RULE, first_season_pack_reading, OVA_ENTRY_TAG, first_season_reading,
                     first_season_stated, release_matches_target, FIRST_SEASON_SHOW_SKIP, pack_show_reason,
                     related_entry_reading, RELATED_ENTRY_TAG)
@@ -256,6 +258,36 @@ def tv_series_entry(log: Log, anilist_id: int, format_from: dict, movie: bool, s
                      f"not a TV series ({said}): its own episodes may say OVA"),
              suggest="check the entry's format on anilist.co and ani.zip's mappings.type" if conflict else "")
     return tv
+
+
+def _date_year(date) -> int | None:
+    """The year of an AniList FuzzyDate (`{"year": 2015, …}`), or None when it is no dict or its year is no positive
+    int (a string, a bool, 0, missing)."""
+    year = date.get("year") if isinstance(date, dict) else None
+    return year if isinstance(year, int) and not isinstance(year, bool) and year > 0 else None
+
+
+def entry_years(log: Log, anilist_id: int, tv_series: bool, titles=()) -> tuple[int | None, int | None]:
+    """`(start, end)`: the years a TV series started and ended, from AniList's `startDate` and `endDate` in the titles
+    cache (`known_titles`), each None when the cache holds no valid year (`_date_year`). The own-season rule drops a
+    name stating the entry's own season whose series year is after the entry's last year (`end`, else `start + 1`),
+    and no title holds (`EpisodeQuery.start_year`, `end_year`, `score.later_series_years`). Not read for an entry
+    that is no TV series (a movie's or a special's name may carry its parent series' year); without a start year
+    the year rule is off; without an end year (still airing, or a cache written before `endDate` was read) the last
+    year is `start + 1`. One `resolve start_year` line, with the raw dates read and every title of the entry the
+    own-season rule compares a name's words against (`titles`)."""
+    known = (known_titles(anilist_id) or {}) if tv_series else {}
+    start_raw, end_raw = known.get("startDate"), known.get("endDate")
+    start, end = _date_year(start_raw), _date_year(end_raw)
+    last = (end or start + 1) if start else None
+    log.info("resolve", "start_year", result="PASS" if start else "SKIP", anilist_id=anilist_id, start_year=start,
+             end_year=end, last_year=last, start_date=start_raw, end_date=end_raw,
+             source="anilist.titles startDate, endDate", titles=list(titles or ()),
+             reason=("a TV series: with franchise shows, a name stating its own season that gives its series a year "
+                     "after the entry's last year, which no title holds, is another show" if start else
+                     "not a TV series: the year rule is not asked" if not tv_series else
+                     f"the titles cache holds no valid start year ({start_raw!r}): the year rule is off"))
+    return start, end
 
 
 def anilist_episode_count(anilist_id: int, chain: dict | None = None) -> tuple[int | None, str, int | None]:
@@ -516,10 +548,12 @@ def franchise_shows_for(log: Log, anilist_id: int, entry: dict, movie: bool, sin
     failed read logs a WARN and keeps today's filter. One `resolve franchise_shows` line says which, with the ids and
     the request's time.
 
-    A first season (no sequel verdict from the entry identity, `entry`) reads them too, for the stated-part
-    reading only, and only when `index_search` finds a name stating a part none of the entry's titles state
-    (`first_season_parts`): `Show Part 2 - 04` is the second part's episode 4, not the first's. The same cache, miss
-    marker and one attempt; the line says `sequel: null` and which reading the shows feed.
+    A first season (no sequel verdict from the entry identity, `entry`) reads them too, only when `index_search` finds
+    a name stating a part none of the entry's titles state or adding a word none of them hold (`first_season_parts`):
+    `Show Part 2 - 04` is the second part's episode 4, and `Show 0 - 02` the sequel `Show 0`'s episode 2, not the
+    first season's. The shows feed the stated-part reading and the exact-title reading of those names, on both passes
+    (`first_season_show_reading`). The same cache, miss marker and one attempt; the line says `sequel: null` and which
+    readings the shows feed.
 
     The read is enrichment, so it is one attempt (`AniList.franchise`,
     `retries=1`: a hung AniList costs one `httpTimeout`, not three plus backoff), and a failure is remembered for
@@ -611,9 +645,11 @@ def franchise_shows_for(log: Log, anilist_id: int, entry: dict, movie: bool, sin
 
 # What a first season's franchise shows are read for (the `resolve franchise_shows` and `index.search
 # franchise_part` lines).
-FIRST_SEASON_PARTS = ("a first season: only a single stating a part none of the entry's titles state, where a show is "
-                      "one of those titles plus that part, is dropped as `franchise_show`; a name "
-                      "that is exactly another show's title is kept")
+FIRST_SEASON_PARTS = ("a first season: a single stating a part none of the entry's titles state, where a show is "
+                      "one of those titles plus that part, and a name adding a word none of the entry's titles hold "
+                      "whose words are exactly another show's title (a pack-pass record: its words, its range set "
+                      "aside), are dropped as `franchise_show`; a name adding no word is kept though it is exactly "
+                      "another show's title")
 
 
 def log_franchise_shows(log: Log, anilist_id: int, entry: dict, shows: tuple, t0: float, movie: bool = False,
@@ -973,14 +1009,51 @@ def first_season_packs(packs: list[dict], query: "indexers.EpisodeQuery", sink: 
     return kept
 
 
+def first_season_show_reading(title: str, query: "indexers.EpisodeQuery", shows: tuple, added: tuple,
+                              pack_pass: bool = False) -> tuple[str | None, str, frozenset, bool]:
+    """The one reading of a first season's name against the franchise `shows` its first pass read
+    (`first_season_parts`), on the first pass and on the pack pass alike:
+    - a name adding a word (`added`, `score.first_season_added_words`) is asked the exact-title reading of its words
+      before the episode marker (`score.franchise_reading`, the entry's variants and titles its own), then of its words
+      before its first explicit marker whatever episode it states (`score.marked_show`: `Show 0 - 01` returned for
+      episode 2, a one-file torrent that plays its only file). A part reason is set aside there: a pack is exempt
+      from the part reading, and a single's stated part was asked first;
+    - a pack-pass record, and a first-pass name adding a word that is read as a range (`score.pack_range_search`),
+      is asked the pack reading too: its whole-name words, its ranges set aside (`score.first_season_show_pack`).
+    `(reason, why, words, near)`: the drop (`franchise_show`; None when kept), why it was kept ("" when nothing was
+    asked), and the pack reading's words and whether they share one with a franchise title (empty, False when it was
+    not asked)."""
+    own = (*query.variants, *query.titles)
+    why = ""
+    if added:
+        exact = franchise_reading(title, list(own), shows, query.episode, query.alt_numbers, query.titles)
+        if exact.reason and FRANCHISE_PART_TAG not in exact.reason:
+            return (f"{exact.reason}; a first season reads it, as the name adds \"{' '.join(added)}\" "
+                    f"({FIRST_SEASON_SHOW_TAG})"), "", frozenset(), False
+        marked = marked_show(title, own, shows)[0]
+        if marked:
+            return marked, "", frozenset(), False
+        why = f"adds \"{' '.join(added)}\": {exact.why or PACK_EXEMPT_PART}"
+    if not (pack_pass or (added and pack_range_search(title))):
+        return None, why, frozenset(), False
+    pack = first_season_show_pack(title, own, shows)
+    if pack.reason:
+        return pack.reason, "", pack.words, True
+    return None, why or "its words, its ranges set aside, are no franchise show's title", pack.words, pack.near
+
+
 PACK_SHOW_NAMES_LOGGED = 40             # names on one `index.search pack_show` line
 PACK_SHOW_REASON = ("the pack pass: a record of another show is dropped, whichever add-on returned it, by the show "
-                    "test the built-in Torznab add-on asks a pack (the episode not asked); a record whose info hash "
-                    "the first pass returned is left to the merge, which keeps the first pass's record")
+                    "test the built-in Torznab add-on asks a pack (the episode not asked), and a pack stating the "
+                    "entry's own season that adds a word before its season statement (or, on a TV series, another "
+                    "year) by the own-season words rule (franchise_show), and for a first season whose franchise the "
+                    "first pass read, a pack whose words, its range set aside, are exactly another show's title "
+                    f"(franchise_show, {FIRST_SEASON_SHOW_TAG}); a record whose info hash the first pass "
+                    "returned is left to the merge, which keeps the first pass's record")
 
 
 def pack_pass_show_check(log: Log, packs: list[dict], query: "indexers.EpisodeQuery", sink: RejectedSink,
-                         first_pass: set) -> list[dict]:
+                         first_pass: set, first_season_shows: tuple = ()) -> list[dict]:
     """The pack pass's records, less each of another show. An add-on's pack pass need not ask
     `query.matches`: a free-text add-on may keep every `is_pack` name its pack query found, and a pack query for
     `<title> batch` may find other shows' packs too. The built-in Torznab add-on asks each pack `query.matches`, and a
@@ -988,15 +1061,28 @@ def pack_pass_show_check(log: Log, packs: list[dict], query: "indexers.EpisodeQu
     show and season tests); the plugin asks every pack-pass record that same call (`score.pack_show_reason`), with the
     entry's every title (`query.titles`), so a pack passing Torznab's keep passes here. The episode test is never
     asked: a pack's episode test is its range, which the prefilter reads, and `title_matches_episode` fails
-    a range pack for an episode inside it (`Show S2 (01-12)` for episode 7).
+    a range pack for an episode inside it (`Show S2 (01-12)` for episode 7). A pack the show test passes is asked the
+    own-season words rule Torznab's pack pass asks (`query.own_season_reason`, `franchise_show`): `Show Driftwood 2nd
+    Season [Batch]` is another show's for `Show 2nd Season`, whichever add-on returned it.
 
-    A drop goes to the sink with Torznab's code and reason (`series 0.41`, or the spelling-only reason), so the
-    picker lists it as it lists Torznab's, and the ambiguity guard does not read it (`guard_reads_drop`: a `series`
-    drop is no franchise evidence, on either pass). A record whose info hash the first pass returned is not asked: the
-    merge keeps the first pass's record, which `stated_season_check` has read, so an episode-id search's
-    record is never dropped here. One `index.search pack_show` line whenever the pack pass returned a record,
-    naming each drop with its add-on and why."""
-    kept, names, skipped = [], [], 0
+    A first season's `first_season_shows` (the franchise `first_season_parts` read on the first pass; none when it did
+    not read) are asked of each pack the show test passes, by the first pass's own reading
+    (`first_season_show_reading`: the exact title before the marker of a name adding a word, then the whole name's
+    words, its ranges set aside). A drop is that show's (`franchise_show`) and goes to `sink.part_drops` too, which the
+    `index.search franchise_part` line names; the line says how many shows were handed over (`first_season_shows`) and
+    names each kept pack whose words share one with a franchise title, with its words (`kept_first_season`).
+
+    A show-test drop goes to the sink with Torznab's code and reason (`series 0.41`, or the spelling-only reason), so
+    the picker lists it as it lists Torznab's, and the ambiguity guard does not read it (`guard_reads_drop`: a `series`
+    drop is no franchise evidence, on either pass). An own-season words drop goes with code `franchise_show`, as
+    Torznab's pack pass hands it to `query.reject`: the guard reads it as another show of the franchise (as it read
+    the same name while it was ranked), and `_resolve` keeps it off the picker's rows, as every `franchise_show` drop.
+    A record whose info hash the first pass returned is not asked: the merge keeps the first pass's record, which
+    `stated_season_check` has read, so an episode-id search's record is never dropped here. One `index.search
+    pack_show` line whenever the pack pass returned a record, naming each drop with its add-on and why, and under
+    `kept_own_season` each kept pack the own-season words rule read, with why it stayed and the words it read."""
+    kept, names, skipped, own_kept, first_kept = [], [], 0, [], []
+    own_titles = (*query.variants, *query.titles)
     for rel in packs:
         title, ix = str(rel.get("title") or ""), str(rel.get("indexer") or "?")
         key = str(rel.get("info_hash") or "").lower()
@@ -1005,8 +1091,20 @@ def pack_pass_show_check(log: Log, packs: list[dict], query: "indexers.EpisodeQu
             kept.append(rel)
             continue
         why = pack_show_reason(title, query.variants, query.episode, query.alt_numbers, query.season, query.titles)
+        own = None if why else query.own_season_reading(title)
+        why = why or (own.reason if own is not None else None)
+        if not why and first_season_shows:
+            added = first_season_added_words(title, own_titles, query.episode, query.alt_numbers)
+            why, first_why, words, near = first_season_show_reading(title, query, first_season_shows, added,
+                                                                    pack_pass=True)
+            if why:
+                sink.part_drops.append([ix, title, why])
+            elif near:
+                first_kept.append([ix, title, first_why, sorted(words)])
         if not why:
             kept.append(rel)
+            if own is not None:
+                own_kept.append([ix, title, own.why, list(own.words)])
             continue
         names.append([ix, title, why])
         sink.add(rel, why.split()[0], why, ix)
@@ -1014,7 +1112,12 @@ def pack_pass_show_check(log: Log, packs: list[dict], query: "indexers.EpisodeQu
         log.info("index.search", "pack_show", result="PASS" if names else "EMPTY", episode=query.episode,
                  checked=len(packs) - skipped, first_pass=skipped, dropped=len(names),
                  names=names[:PACK_SHOW_NAMES_LOGGED], more=max(0, len(names) - PACK_SHOW_NAMES_LOGGED),
-                 reason=PACK_SHOW_REASON)
+                 kept_own_season=own_kept[:PACK_SHOW_NAMES_LOGGED],
+                 kept_own_season_more=max(0, len(own_kept) - PACK_SHOW_NAMES_LOGGED),
+                 **({"first_season_shows": len({s[0] for s in first_season_shows}),
+                     "kept_first_season": first_kept[:PACK_SHOW_NAMES_LOGGED],
+                     "kept_first_season_more": max(0, len(first_kept) - PACK_SHOW_NAMES_LOGGED)}
+                    if first_season_shows else {}), reason=PACK_SHOW_REASON)
     return kept
 
 
@@ -1165,46 +1268,102 @@ STATED_SEASON_LOG_ONLY = ("an entry whose titles state a season: a record statin
                           "the add-ons' season test is not asked of a record after the merge")
 
 
+FIRST_SEASON_PACKS_LOGGED = 10          # multi-show packs named on one `score.file_identity first_season` line
+
+
+def first_season_franchise(log: Log, entry: dict, ranked: list[dict], shows_read: list, read: Callable[[], tuple],
+                           own_titles) -> dict:
+    """A first season's entry identity with the franchise shows its pack file pick reads
+    (`score.first_season_file_check`): the shows the search read (`shows_read`, `first_season_parts`' answer,
+    carried), else, when a ranked pack names more than the entry (`score.multi_show_pack`) and none were read, `read()`
+    now (`franchise_shows_for`: its cache, TTL and miss marker; no hop more). No pack naming more, or a read that gave
+    no shows (failed, or none): the entry carries none, and each pack's file is picked by its number as before. One
+    `score.file_identity first_season` line says which, with the packs and the source."""
+    titles = list(entry.get("titles") or [])
+    packs = [c["title"] for c in ranked if (c.get("parsed") or {}).get("batch")
+             and multi_show_pack(c.get("title") or "", titles, own_titles)]
+    if shows_read:
+        shows, source = shows_read[0], "carried"
+    elif packs:
+        shows, source = tuple(read() or ()), "read now"
+    else:
+        shows, source = (), "none"
+    on = bool(packs) and bool(shows)
+    log.info("score.file_identity", "first_season", result="PASS" if on else "SKIP", source=source,
+             shows=len({s[0] for s in shows}), packs=packs[:FIRST_SEASON_PACKS_LOGGED],
+             packs_more=max(0, len(packs) - FIRST_SEASON_PACKS_LOGGED),
+             reason=("a first season's pack names more than the entry: its file must be the entry's (no franchise "
+                     "show's, no other season's, no extras folder's; a file naming nothing more first)" if on else
+                     "the franchise read gave no shows: each pack's file is picked by its number, as before"
+                     if packs else "no ranked pack names more than the entry: each pack's file is picked by its "
+                     "number, as before"))
+    if not on:
+        return entry
+    return {**entry, "own_titles": list(own_titles), "first_season_shows": [list(s) for s in shows],
+            "first_season_from": source}
+
+
 def first_season_parts(log: Log, releases: list[dict], query: "indexers.EpisodeQuery", read: Callable[[], tuple],
                        sink: "RejectedSink") -> tuple[list[dict], "indexers.EpisodeQuery | None", list[list]]:
-    """A first season's search without another part's singles. "First season" is the entry identity's: no sequel
-    verdict (`_resolve`'s `lazy_first`), not the first-season reading's `first_season` (ani.zip's S1E1). After the first
-    pass, when a returned name states a part before its episode marker that none of the entry's titles state
-    (`score.extra_parts`, the question the `franchise_part` reading asks first), the franchise is read (`read`,
-    `_resolve`'s `franchise_shows_for`: its cache, miss marker and WARN) and each such name is asked the stated-part
-    reading alone (`EpisodeQuery.franchise_reading(parts_only=True)`), of every add-on's records, as
-    `drop_compilation_films` asks after the merge. No such name: AniList is not asked. A drop goes to `sink` as
-    `franchise_show` (not a picker row; `picked_release` finds a viewer's earlier pick of it) and to `sink.part_drops`,
-    which the `index.search franchise_part` line names. Returns the releases kept, the query the reading asked (None
-    when it was not asked), and `near`: `[indexer, title, why]` of each other returned name whose words touch a
-    franchise title, with why it stayed (a name that is exactly another show's title, `FIRST_SEASON_EXACT`; logging
-    only, no read). One `index.search first_season_parts` line either way, naming the parts that asked the read."""
-    own = title_parts((*query.variants, *query.titles))
-    extra = [(r, extra_parts(str(r.get("title") or ""), own, query.episode, query.alt_numbers)) for r in releases]
-    named = [[r.get("indexer"), str(r.get("title") or ""), sorted(p)] for r, p in extra if p]
-    log.info("index.search", "first_season_parts", result="PASS" if named else "SKIP", episode=query.episode,
+    """A first season's search without another part's singles or another show's names. "First season" is the entry
+    identity's: no sequel verdict (`_resolve`'s `lazy_first`), not the first-season reading's `first_season` (ani.zip's
+    S1E1). After the first pass, when a returned name states a part before its episode marker that none of the entry's
+    titles state (`score.extra_parts`, the question the `franchise_part` reading asks first) or adds a word none of
+    them hold (`score.first_season_added_words`, the own-season words rule's reader; CJK-only words exempt), the
+    franchise is read (`read`, `_resolve`'s `franchise_shows_for`: its cache, miss marker and WARN), of every add-on's
+    records, as `drop_compilation_films` asks after the merge. No such name: AniList is not asked.
+    - A name stating a part is asked the stated-part reading (`EpisodeQuery.franchise_reading(parts_only=True)`).
+    - A name adding a word is asked the exact-title reading too (`score.franchise_reading`, the entry's variants and
+      titles its own), a range-read `Title 0 - 02` included: exactly another show's title is that show's.
+      A name adding no word is kept though it is exactly another show's title (`FIRST_SEASON_EXACT`).
+    A drop goes to `sink` as `franchise_show` (not a picker row; the ambiguity guard reads it, `guard_reads_drop`;
+    `picked_release` finds a viewer's earlier pick of it) and to `sink.part_drops`, which the `index.search
+    franchise_part` line names. Returns the releases kept, the query the reading asked (None when it was not asked:
+    its `franchise_shows` reach the pack pass, `pack_pass_show_check`), and `near`: `[indexer, title, why]` of each
+    other returned name whose words touch a franchise title or that adds a word, with why it stayed (logging only, no
+    read). One `index.search first_season_parts` line either way, naming the parts and the words that asked the
+    read."""
+    own_titles = (*query.variants, *query.titles)
+    own = title_parts(own_titles)
+    extra = [(r, extra_parts(str(r.get("title") or ""), own, query.episode, query.alt_numbers),
+              first_season_added_words(str(r.get("title") or ""), own_titles, query.episode, query.alt_numbers))
+             for r in releases]
+    named = [[r.get("indexer"), str(r.get("title") or ""), sorted(p)] for r, p, _ in extra if p]
+    adding = [[r.get("indexer"), str(r.get("title") or ""), list(w)] for r, _, w in extra if w]
+    asks = [x for x, has in (("states a part before its episode marker that none of the entry's titles state",
+                              named),
+                             ("adds a word none of the entry's titles hold (the own-season words rule's reader, "
+                              "CJK-only words exempt)", adding)) if has]
+    log.info("index.search", "first_season_parts", result="PASS" if asks else "SKIP", episode=query.episode,
              checked=len(releases), stating=named[:FRANCHISE_PART_NAMES_LOGGED],
              stating_more=max(0, len(named) - FRANCHISE_PART_NAMES_LOGGED),
-             reason=("a first season: a returned name states a part before its episode marker that none of the "
-                     "entry's titles state, so the franchise is read for the stated-part reading"
-                     if named else "a first season: no returned name states a part before its episode marker that "
-                     "none of the entry's titles state, so AniList is not asked for the franchise"))
-    if not named:
+             adding=adding[:FRANCHISE_PART_NAMES_LOGGED], adding_more=max(0, len(adding) - FRANCHISE_PART_NAMES_LOGGED),
+             reason=(f"a first season: a returned name {' and one '.join(asks)}, so the franchise is read for the "
+                     "stated-part and exact-title readings" if asks else
+                     "a first season: no returned name states a part before its episode marker or adds a word that "
+                     "none of the entry's titles state or hold, so AniList is not asked for the franchise"))
+    if not asks:
         return releases, None, []
     shows = tuple(read() or ())
     if not shows:
         return releases, None, []
     parts = dataclasses.replace(query, franchise_shows=shows, part_drops=[])
     kept, near = [], []
-    for rel, stated in extra:
+    for rel, stated, added in extra:
         title = str(rel.get("title") or "")
         reading = parts.franchise_reading(title, parts_only=True)
-        if stated and reading is not None and reading.reason:
-            sink.append((rel, FRANCHISE_SHOW, reading.reason))
+        reason = reading.reason if stated and reading is not None else None
+        why = ""
+        if not reason:
+            reason, why, _words, _near = first_season_show_reading(title, query, shows, added)
+        if reason:
+            sink.append((rel, FRANCHISE_SHOW, reason))
             sink.indexer_of[id(rel)] = rel.get("indexer")
-            sink.part_drops.append([rel.get("indexer"), title, reading.reason])
+            sink.part_drops.append([rel.get("indexer"), title, reason])
             continue
-        if not stated and reading is not None and reading.near:
+        if why:
+            near.append([rel.get("indexer"), title, why])
+        elif not stated and reading is not None and reading.near:
             near.append([rel.get("indexer"), title, reading.why])
         kept.append(rel)
     # Another show's exact title first: the 40 names the line holds are for "why wasn't it dropped?".
@@ -1249,7 +1408,8 @@ def index_search(http: Http, log: Log, ids: dict, episode: int, variants: list[s
                  related_shows: tuple = (), season: int | None = None, franchise_shows: tuple = (),
                  first_season: bool = False, first_season_titles: tuple = (), titles: tuple = (),
                  prequel_shows: tuple = (), first_season_franchise: Callable[[], tuple] | None = None,
-                 tv_series: bool = False) -> list[dict]:
+                 tv_series: bool = False, start_year: int | None = None,
+                 end_year: int | None = None) -> list[dict]:
     """Every loaded indexer add-on's releases for this episode, keyed by infohash.
     `reg` is a registry this request already loaded (`releases`); else the folder is loaded here.
 
@@ -1307,6 +1467,10 @@ def index_search(http: Http, log: Log, ids: dict, episode: int, variants: list[s
     of them without an episode marker, which matched the movie only through titles that entry shares, is dropped
     (`related_entry_check`).
 
+    A TV series' `start_year` and `end_year` (`entry_years`) reach them as `query.start_year`, `query.end_year`: with
+    franchise shows, a name stating the entry's own season that gives its series a year after the entry's last year
+    is another show (`EpisodeQuery.own_season_reason`).
+
     With no add-on loaded it stops before asking anything, at `indexers.NONE_STAGE`
     (`indexers.require`), rather than returning nothing and failing as "no releases found"."""
     t0 = time.monotonic()
@@ -1325,7 +1489,8 @@ def index_search(http: Http, log: Log, ids: dict, episode: int, variants: list[s
                                   first_season_titles=tuple(first_season_titles or ()) if first_season else (),
                                   titles=tuple(titles or ()),
                                   prequel_shows=tuple(prequel_shows or ()) if single_episode and not movie else (),
-                                  tv_series=bool(tv_series))        # `tv_series_entry` is the one gate
+                                  tv_series=bool(tv_series),        # `tv_series_entry` is the one gate
+                                  start_year=start_year, end_year=end_year)
     failures: list = []
     # The drops are read back from the sink, with the indexer of each, so one is kept even when the
     # caller passes none; the caller's list gets the same entries at the end.
@@ -1341,7 +1506,13 @@ def index_search(http: Http, log: Log, ids: dict, episode: int, variants: list[s
     releases = related_entry_check(log, releases, query, related_entries, sink)
     parts_query, near = None, []                             # what a first season's part reading asked
     if first_season_franchise is not None and not (movie or single_episode or query.franchise_shows):
+        before = releases
         releases, parts_query, near = first_season_parts(log, releases, query, first_season_franchise, sink)
+        kept_ids = {id(r) for r in releases}
+        for r in before:                   # its drops are not merged back from the pack pass either
+            if id(r) not in kept_ids:
+                unasked_drops.setdefault(str(r.get("info_hash") or "").lower(),
+                                         [str(r.get("indexer") or "?"), str(r.get("title") or "")])
     few, counted, out_of_range = pack_pass_decision(releases, episode, alt, season, variants)
     run = packs_allowed and few and bool(variants)
     # The decision is logged both ways, with what counted and the seeded packs that did not.
@@ -1372,10 +1543,11 @@ def index_search(http: Http, log: Log, ids: dict, episode: int, variants: list[s
             packs = [p for p in packs if str(p.get("info_hash") or "").lower() not in unasked_drops]
             log.info("index.search", "stated_season_again", result="PASS", episode=episode, dropped=len(again),
                      names=again[:STATED_SEASON_NAMES_LOGGED],
-                     reason="the pack pass returned a release the first pass's stated-season check dropped; "
-                            "it is not merged back")
+                     reason="the pack pass returned a release the first pass dropped (the stated-season "
+                            "check, or a first season's franchise reading); it is not merged back")
         # Another show's pack, whichever add-on returned it, before any reading of the entry's own packs.
-        packs = pack_pass_show_check(log, packs, query, sink, first_pass)
+        packs = pack_pass_show_check(log, packs, query, sink, first_pass,
+                                     parts_query.franchise_shows if parts_query is not None else ())
         packs = related_entry_check(log, packs, query, related_entries, sink, pack_pass=True)  # related entries
         if movie:
             kept, gone = [], []
@@ -1588,6 +1760,7 @@ def pick_pack_files(ranked: list[dict], log: Log, settings: dict, lang: str,
         skipped: list = []
         picked = pick_episode_file(files, cand["episode"], cand.get("alt"), cand.get("entry"), cand.get("title") or "",
                                    skipped)
+        providersmod.log_first_season_pick(log, "score.file_pick", cand, picked, skipped)
         passed_over = skipped_summary(skipped, cand.get("entry"))
         if not picked and not cand.get("files_complete", True):
             log.info("score.file_pick", "partial", result="SKIP", id=cand["id"], title=cand["title"],
@@ -1611,6 +1784,7 @@ def pick_pack_files(ranked: list[dict], log: Log, settings: dict, lang: str,
                                   "file of it)" if season_relative else
                                   " (a file whose stray number is the episode states another in its marker)"
                                   if skipped else "")))
+            cand["files_set_aside"] = skipped           # what a refusal names (`_resolve`'s `score.file_pick`)
             if rejected_sink is not None:
                 rejected_sink.append(cand)
             continue
@@ -1931,7 +2105,8 @@ def picked_release(http: Http, log: Log, args, ids: dict, variants: list[str], s
                    related_shows: tuple = (), season: int | None = None,
                    franchise_shows: tuple | Callable[[], tuple] = (), first_season: bool = False,
                    first_season_titles: tuple = (), titles: tuple = (), prequel_shows: tuple = (),
-                   first_season_franchise: Callable[[], tuple] | None = None, tv_series: bool = False) -> list[dict]:
+                   first_season_franchise: Callable[[], tuple] | None = None, tv_series: bool = False,
+                   start_year: int | None = None, end_year: int | None = None) -> list[dict]:
     """The release the viewer picked, as the index served it: from the pin (a pinned pack), from the
     stored search (any age: the pick came from it), else from one fresh search. Never rebuilt from
     its hash (a magnet rebuilt from it has no trackers). The fresh search carries the first search's filter inputs (the
@@ -1951,7 +2126,7 @@ def picked_release(http: Http, log: Log, args, ids: dict, variants: list[str], s
                              related_shows=related_shows, season=season, franchise_shows=franchise_shows,
                              first_season=first_season, first_season_titles=first_season_titles, titles=titles,
                              prequel_shows=prequel_shows, first_season_franchise=first_season_franchise,
-                             tv_series=tv_series)
+                             tv_series=tv_series, start_year=start_year, end_year=end_year)
         pool = found + [r for r, _, _ in rejected]
         rel = next((r for r in pool if str(r.get("info_hash") or "").lower() == search.pick), None)
         how = "searched again"
@@ -2331,6 +2506,7 @@ def _resolve(args, log: Log, settings: dict, dry_run: bool, ranked_sink: list | 
     # A first season names no season, so ani.zip says whether a single stating season 2 is another's.
     first = first_season_for(log, args.anilist_id, args.episode, season, entry, mapping, movie, single_episode)
     own_titles = entry_titles(args.anilist_id, variants)      # every title, for the show test and the guard
+    start_year, end_year = entry_years(log, args.anilist_id, tv_series, own_titles)     # the own-season year rule's
     first_titles = own_titles if first else ()
     # A viewer's pick reads it only when `picked_release` must search again.
     read_franchise = functools.partial(franchise_shows_for, log, args.anilist_id, entry, movie, single_episode, pinned,
@@ -2339,14 +2515,23 @@ def _resolve(args, log: Log, settings: dict, dry_run: bool, ranked_sink: list | 
     # The prefetch's release was found by a search that read the franchise; this play searches nothing.
     franchise = () if lazy_first or reused is not None else read_franchise if picked and not pinned else (
         read_franchise())
-    first_franchise = read_franchise if lazy_first else None
+    # What a first season's search read (`first_season_parts`), once: the pack file pick reads the same shows
+    # (`first_season_franchise`), so a resolve asks the franchise at most once.
+    first_shows: list = []
+
+    def read_first_franchise() -> tuple:
+        if not first_shows:
+            first_shows.append(tuple(read_franchise() or ()))
+        return first_shows[0]
+    first_franchise = read_first_franchise if lazy_first else None
     guard_dropped: list = []                   # the franchise drops the guard still reads
     if picked:
         releases = picked_release(http, log, args, ids, variants, series_title, settings, search,
                                   movie_pairs=movie_pairs, single_episode=single_episode, related_shows=related,
                                   season=season, franchise_shows=franchise, first_season=first,
                                   first_season_titles=first_titles, titles=own_titles, prequel_shows=prequels,
-                                  first_season_franchise=first_franchise, tv_series=tv_series)
+                                  first_season_franchise=first_franchise, tv_series=tv_series,
+                                  start_year=start_year, end_year=end_year)
         # A pick still gets a side-loaded track, and its donors are the other releases of the
         # search it was picked from — the one-release list alone has no sibling to donate one.
         donor_releases = releases                # `release_donor_pool` adds the stored search's releases
@@ -2362,7 +2547,8 @@ def _resolve(args, log: Log, settings: dict, dry_run: bool, ranked_sink: list | 
                                 movie_pairs=movie_pairs, single_episode=single_episode, related_shows=related,
                                 season=season, franchise_shows=franchise, first_season=first,
                                 first_season_titles=first_titles, titles=own_titles, prequel_shows=prequels,
-                                first_season_franchise=first_franchise, tv_series=tv_series)
+                                first_season_franchise=first_franchise, tv_series=tv_series, start_year=start_year,
+                                end_year=end_year)
         search.add_raw(releases)
         if getattr(args, "prefetch", False):
             # What the play of this episode reuses (`do_prefetch` saves the release it stops at): the releases as the
@@ -2431,8 +2617,12 @@ def _resolve(args, log: Log, settings: dict, dry_run: bool, ranked_sink: list | 
     readings = [] if picked else [(t, *sibling_reading(t, variants, movie)) for t in titles]
     changed = [(t, new, old, known) for t, new, old, known in readings if new != old]
     other_script = sorted({(old, new) for _, new, old, _ in changed}, key=lambda p: (p[0], p[1] or ""))
+    # The ranked releases the guard reads as the entry's own: the picker's passed rows after a refusal
+    # (`mark_other_shows` marks the others by the same reading).
+    own_left = 0 if picked else sum(1 for t in titles if guard_reading(t, variants, movie, own_titles)[0] is None)
     log.info("score.ambiguous", "check", result="FAIL" if len(siblings) >= AMBIGUOUS_SIBLINGS else "PASS",
-             siblings=siblings, threshold=AMBIGUOUS_SIBLINGS, candidates=len(ranked), picked=bool(picked),
+             siblings=siblings, threshold=AMBIGUOUS_SIBLINGS, candidates=len(ranked), own_left=own_left,
+             picked=bool(picked),
              movie=movie, movie_from=movie_from, format_from=format_from, ignored=ignored,
              other_script=[list(p) for p in other_script][:25],
              set_aside=[[old, *v] for old, v in sorted(set_aside.items())][:GUARD_SET_ASIDE_LOGGED],
@@ -2445,13 +2635,15 @@ def _resolve(args, log: Log, settings: dict, dry_run: bool, ranked_sink: list | 
         log.debug("score.ambiguous", "other_script", titles=[
             {"title": t, "every_script": old, "name": new, "scripts": known} for t, new, old, known in changed[:25]])
     if len(siblings) >= AMBIGUOUS_SIBLINGS:
-        search.mark_other_shows(ranked, variants, movie=movie)
+        search.mark_other_shows(ranked, variants, movie=movie, own=own_titles)
         shown = ", ".join(n.title() for n in sorted(siblings, key=len)[:2])
-        raise StageError("score.ambiguous",
-                         f"The releases found are {len(siblings)} other {series_title} shows ({shown}…); "
-                         f"nothing was played.",
+        # What was found, as the picker shows it: the entry's own releases left, then the other shows.
+        found = (f"Found {own_left} release{'s' if own_left != 1 else ''} of {series_title} and {len(siblings)} other "
+                 f"{series_title} shows ({shown}…); they can't be told apart, so nothing was played." if own_left else
+                 f"The releases found are {len(siblings)} other {series_title} shows ({shown}…); nothing was played.")
+        raise StageError("score.ambiguous", found,
                          "the index can't tell this entry apart from its franchise; no safe release to pick",
-                         siblings=siblings, candidates=[c["title"] for c in ranked[:5]])
+                         siblings=siblings, own_left=own_left, candidates=[c["title"] for c in ranked[:5]])
     lang = settings["subtitleLanguage"]
     alt = ids.get("alt_numbers") or []
     # `require` means "the preferred language will be on screen", not "the chosen release
@@ -2512,6 +2704,8 @@ def _resolve(args, log: Log, settings: dict, dry_run: bool, ranked_sink: list | 
                              f"side-load. Switch subtitlePolicy to prefer, or choose a release (p).",
                              "switch subtitlePolicy to prefer, or press p to choose a release",
                              candidates=[c["title"] for c in ranked[:5]], examined=examined)
+    if lazy_first:
+        entry = first_season_franchise(log, entry, ranked, first_shows, read_first_franchise, own_titles)
     for cand in ranked:
         cand["episode"], cand["alt"], cand["entry"] = args.episode, alt, entry
     # The side-load pool: every ranked candidate, **plus** the releases the prefilter dropped.
@@ -2581,9 +2775,16 @@ def _resolve(args, log: Log, settings: dict, dry_run: bool, ranked_sink: list | 
         search.reject(cand, "pack_files")
     search.set_passed(ranked)
     if not ranked:
+        # A first season's packs held the number only in other shows', seasons' or extras folders' files.
+        aside = set_aside_words([x for c in no_file for x in c.get("files_set_aside") or ()])
         if picked:
-            raise StageError("score.file_pick", f"The pack you picked has no file for episode {args.episode}.",
-                             "choose another release")
+            raise StageError("score.file_pick", f"The pack you picked has no file for episode {args.episode}"
+                             + (f": its files numbered {args.episode} were set aside: {aside}." if aside else "."),
+                             "choose another release", **({"set_aside": aside} if aside else {}))
+        if aside:
+            raise StageError("score.file_pick", f"No release holds episode {args.episode} of {series_title}: its "
+                             f"packs' files numbered {args.episode} were set aside: {aside}.",
+                             "pick another release or wait for a new one", set_aside=aside)
         raise StageError("score.file_pick", f"no release contains episode {args.episode}", "pick another release or wait for a new one")
     result["candidates"] = public_candidates(ranked)
     if getattr(args, "prefetch", False):
@@ -3952,26 +4153,23 @@ PICKER_STAGES = ("index.search", "score.prefilter", "score.ambiguous", "score.de
 def lend_picker_key(log: Log, args, stage: str, background: bool) -> bool:
     """A play refused at a picker stage, with the player up for it: `p` there can open the picker on this episode
     (`player.arm_picker_key`), whatever started the play (Browse, the bar, the player's list, auto-next, a
-    notification's click: each is this command). The player's script decides at each press: the picker only while
-    nothing is watched, else what `p` did. Not from the background: the player is the episode being watched, where `p`
-    is mpv's pause and the refusal draws nothing. Never raises: the refusal is what the caller reports. True when
-    lent."""
+    notification's click: each is this command). The player's script decides at each press: the picker while nothing
+    is watched, or, for a play in the `background` (the player is the episode being watched), while the refusal's
+    corner line is up, where the press also runs what `p` did (its pause); else what `p` did (a background refusal
+    that lent nothing left the viewer to close the player). Never raises: the refusal is what the caller
+    reports. True when lent."""
     if stage not in PICKER_STAGES:
         return False
     # Every line of the lend names the same three: the refusal's stage and the episode it refused.
-    ids = {"stage_failed": stage, "mediaId": args.anilist_id, "episode": args.episode}
-    if background:
-        log.info("player.picker_key", "arm", result="SKIP", **ids,
-                 reason="the play ran in the background: the player is the episode being watched",
-                 suggest="the popout's Choose a release opens the picker")
-        return False
+    ids = {"stage_failed": stage, "mediaId": args.anilist_id, "episode": args.episode, "background": bool(background)}
     mpv = Mpv(log)
     try:
         if not (MPV_SOCKET.exists() and mpv._try_connect()):
             log.info("player.picker_key", "arm", result="SKIP", **ids, reason="no running player",
                      suggest="the popout's Choose a release opens the picker")
             return False
-        return bool(playermod.arm_picker_key(mpv, log, args.anilist_id, args.episode, stage).get("armed"))
+        return bool(playermod.arm_picker_key(mpv, log, args.anilist_id, args.episode, stage,
+                                             background=bool(background)).get("armed"))
     except Exception as exc:                 # noqa: BLE001 - a key binding must never replace the refusal
         log.warn("player.picker_key", "arm", result="FAIL", **ids, error=f"{type(exc).__name__}: {exc}",
                  suggest="the popout's Choose a release opens the picker")

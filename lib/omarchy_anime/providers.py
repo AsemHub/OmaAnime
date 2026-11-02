@@ -13,7 +13,8 @@ import urllib.request
 from pathlib import Path
 
 from . import core
-from .score import pick_episode_file, pick_refused_suggest, skipped_summary
+from .score import (pick_episode_file, pick_refused_suggest, skipped_summary, set_aside_words, FILE_FRANCHISE_SHOW,
+                    FILE_OTHER_SEASON, FILE_EXTRAS_FOLDER)
 from .core import (Http, Log, StageError, BlockedError, Interrupted, ProviderUnavailableError, cached_json, write_cache,
                    RD_URL, TORBOX_URL, CACHE_DIR, USER_AGENT, as_int, DEFAULT_SETTINGS, pack_files,
                    FILES_COMPLETE, FILES_FAILED, FILES_UNKNOWN, LARGE_MAX_BYTES)
@@ -73,6 +74,33 @@ def identity_for(log: Log, stage: str, cand: dict) -> dict | None:
         log.info(stage, "identity", result="SKIP", id=cand.get("id"),
                  reason="no entry identity on this candidate: its file is picked by its number alone")
     return entry
+
+
+FIRST_SEASON_CODES = (FILE_FRANCHISE_SHOW, FILE_OTHER_SEASON, FILE_EXTRAS_FOLDER)
+
+
+def log_first_season_pick(log: Log, site: str, cand: dict, picked: dict | None, skipped: list[dict]) -> None:
+    """One `score.file_identity pick` line for a first season's pack whose file the first-season rule chose
+    (`score.first_season_file_check`), wherever it was picked (`site`: `score.file_pick`, `rd.filepick`,
+    `torbox.filepick`): the rule, the file, the files set aside with their reason, and the franchise source. Nothing
+    for a pick the rule did not read."""
+    aside = [{"path": x["path"], "code": x["code"], "against": x["against"]} for x in skipped
+             if x.get("code") in FIRST_SEASON_CODES]
+    ident = (picked or {}).get("identity") or {}
+    if ident.get("rule") != "first_season" and not aside:
+        return
+    entry = cand.get("entry") or {}
+    log.info("score.file_identity", "pick", result="PASS" if picked else "FAIL", site=site, id=cand.get("id"),
+             title=cand.get("title"), rule="first_season", file=(picked or {}).get("basename"),
+             left=ident.get("left", 0), preferred=ident.get("preferred", False), root=ident.get("root"),
+             set_aside=aside[:10],
+             set_aside_more=max(0, len(aside) - 10), franchise=entry.get("first_season_from"),
+             shows=len({s[0] for s in entry.get("first_season_shows") or ()}),
+             reason=("a first season's pack naming more than the entry: the file is the entry's, after the files "
+                     "of another show, season or extras folder" + ("; a file naming nothing more was preferred"
+                                                                     if ident.get("preferred") else "")
+                     if picked else "every file numbered like this episode is another show's, season's or an "
+                                    "extras folder's: the pack has no file of the entry for it"))
 
 
 def block_file() -> Path:
@@ -387,6 +415,7 @@ class RealDebrid:
                                                 for f in rd_files], cand["episode"],
                                                cand.get("alt"), identity_for(self.log, "rd.filepick", cand),
                                                cand.get("title") or "", skipped)
+                    log_first_season_pick(self.log, "rd.filepick", cand, picked, skipped)
                     if picked:
                         selection = str(picked["id"])
                         self.log.info("rd.filepick", "pick", result="PASS", torrent_id=torrent_id, file=picked["basename"],
@@ -394,7 +423,9 @@ class RealDebrid:
                                       read=picked.get("read"),
                                       **skipped_summary(skipped, cand.get("entry")))
                     elif (cand.get("parsed") or {}).get("batch"):
-                        raise StageError("rd.filepick", f"no file for episode {cand['episode']}",
+                        aside = set_aside_words(skipped)
+                        raise StageError("rd.filepick", f"no file for episode {cand['episode']}"
+                                         + (f"; set aside: {aside}" if aside else ""),
                                          pick_refused_suggest(skipped), torrent_id=torrent_id,
                                          **skipped_summary(skipped, cand.get("entry")))
                     else:
@@ -1381,13 +1412,16 @@ class TorBox:
             skipped: list = []
             picked = pick_episode_file(video, cand["episode"], cand.get("alt"),
                                        identity_for(self.log, "torbox.filepick", cand), cand.get("title") or "", skipped)
+            log_first_season_pick(self.log, "torbox.filepick", cand, picked, skipped)
             if picked:
                 chosen = picked
                 self.log.info("torbox.filepick", "pick", result="PASS", torrent_id=torrent_id, file=picked["basename"],
                               matched=picked["matched"], identity=picked.get("identity"), read=picked.get("read"),
                               **skipped_summary(skipped, cand.get("entry")))
             elif (cand.get("parsed") or {}).get("batch"):
-                raise StageError("torbox.filepick", f"no file for episode {cand['episode']} in torrent {torrent_id}",
+                aside = set_aside_words(skipped)
+                raise StageError("torbox.filepick", f"no file for episode {cand['episode']} in torrent {torrent_id}"
+                                 + (f"; set aside: {aside}" if aside else ""),
                                  pick_refused_suggest(skipped), torrent_id=torrent_id,
                                  files=[f.get("short_name") or f.get("name") for f in video][:20],
                                  **skipped_summary(skipped, cand.get("entry")))

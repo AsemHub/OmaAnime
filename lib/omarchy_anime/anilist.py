@@ -37,6 +37,7 @@ MEDIA_FIELDS = """
   averageScore meanScore popularity isAdult genres
   nextAiringEpisode { episode airingAt timeUntilAiring }
   startDate { year month day }
+  endDate { year month day }
 """
 
 RELATION_FIELDS = """
@@ -344,6 +345,8 @@ def remember_titles(media: dict, log: Log | None = None) -> None:
     2026-10-19) gives the show's original audio language for the dub reading (`score.original_audio`).
     `status`, `nextAiringEpisode` and `startDate` (a FuzzyDate: year, month, day, each optional) are what a play
     reads to refuse an entry that is not out (`not_out`, `cli.not_out_gate`), before anything else, with no request.
+    `startDate` and `endDate` (FuzzyDates) give a TV series' first and last year (`cli.entry_years`), which the
+    own-season rule reads a series year against (`score.later_series_years`).
     All come from `MEDIA_FIELDS`, which every caller queries, and are read back by `plan_hints`. A file
     written before a field existed lacks it until the next list, search or media fetch that goes to
     AniList rewrites it.
@@ -377,6 +380,7 @@ def remember_titles(media: dict, log: Log | None = None) -> None:
            # Without `timeUntilAiring`, which changes on every read and would rewrite the file each time.
            "nextAiringEpisode": {k: nxt.get(k) for k in ("episode", "airingAt")} if nxt else None,
            "startDate": media.get("startDate") if isinstance(media.get("startDate"), dict) else None,
+           "endDate": media.get("endDate") if isinstance(media.get("endDate"), dict) else None,
            "cover": {k: cover.get(k) for k in ("large", "medium")}}
     path = CACHE_DIR / "anilist" / "titles" / f"{mid}.json"
     if cached_json(path, None) != rec:

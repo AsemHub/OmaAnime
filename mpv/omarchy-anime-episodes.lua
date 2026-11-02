@@ -1292,8 +1292,12 @@ local function failure_sentences(e)
     return headline, said_or(said.action, cut and suggest:sub(1, cut - 1) or suggest)
 end
 
--- What the line says, why (one word per rule, for the log), what that rule measured, and a failure's action (said only
--- if it fits).
+-- The corner line's words for a refusal that lent `p` (`cli.lend_picker_key`): the press opens the picker
+-- while the line is up (`picker-key`), so the line names the key.
+local LENT_KEY_TEXT = " \194\183 p: choose a release"
+
+-- What the line says, why (one word per rule, for the log), what that rule measured, a failure's action (said only
+-- if it fits) and, for a refusal that lent `p`, the key's words (said before the action: the action is dropped first).
 local function background_text()
     local e = play_entry
     if line_quit then return "", "quit", "", "" end
@@ -1320,7 +1324,8 @@ local function background_text()
     end
     if e.state == "failed" then
         local headline, action = failure_sentences(e)
-        return "Episode " .. ep_num(e) .. " failed — " .. headline, "failed", "", action
+        local key = (type(e.detail) == "table" and e.detail.picker == true) and LENT_KEY_TEXT or ""
+        return "Episode " .. ep_num(e) .. " failed — " .. headline, "failed", "", action, key
     end
     if e.state == "held" then return status_text(e), "held", "", "" end
     -- "Tell me when it's ready", pressed in Browse: Browse said so; the play has ended.
@@ -1367,7 +1372,8 @@ end
 
 local function draw_line()
     if not line_overlay then return end
-    local text, why, measured, action = background_text()
+    local text, why, measured, action, key = background_text()
+    key = key or ""
     local event, place = "", nil
     if text ~= "" then
         local res_x = canvas_res_x()
@@ -1381,10 +1387,12 @@ local function draw_line()
         local said_action = "none"
         if action ~= "" then
             local both = text .. " " .. sanitize(action)
-            said_action = utf8_len(both) <= budget and "kept" or "dropped (does not fit)"
+            said_action = utf8_len(both) + utf8_len(key) <= budget and "kept" or "dropped (does not fit)"
             if said_action == "kept" then text = both end
         end
-        local fitted = fit_line(text, budget)
+        -- The lent key's words stay whole: the sentence before them is what is cut.
+        local fitted = key ~= "" and (fit_line(text, math.max(4, budget - utf8_len(key))) .. key) or fit_line(text, budget)
+        text = text .. key
         event = "{\\an7\\pos(16," .. y .. ")\\fs" .. size .. "\\bord2\\shad0\\1c&HFFFFFF&}" .. font_tag()
                 .. LRM .. esc(fitted)
         -- Once per change: where it went, the width that set its budget, and whether it was cut.
@@ -1396,7 +1404,7 @@ local function draw_line()
             msg.debug("background line placed: " .. placed)
         end
         place = { y = y, right = math.floor(right), edge = open and "panel" or "tab strip", size = size, budget = budget,
-                  action = said_action, cut = fitted ~= text }
+                  action = said_action, cut = fitted ~= text, key = key ~= "" }
     end
     local was = line_text ~= ""
     line_text = text
@@ -2072,18 +2080,29 @@ end)
 mp.register_script_message("toggle", toggle)
 
 -- `p`, lent by a refused play (`player.arm_picker_key`): its binding sends `picker-key` with what `p` did before the
--- borrow. The press decides, here, where what is watched is known: the picker only while nothing is watched and the
--- entry is still the refusal that lent `p` (the Service checks that entry again); over an episode being watched (a
--- paused one in a hidden window, an ended one sought back) `p` does what it did. `mp.command` runs that command as
--- input.conf would, OSD included (man mpv 0.41). The Service's IPC target is `omaanime` (Service.qml's IpcHandler).
+-- borrow. The press decides, here, where what is watched is known: the picker while the entry is still the refusal
+-- that lent `p` (the Service checks that entry again) and either nothing is watched, or the refusal is a background
+-- play's whose corner line is still up (`background_text`'s `failed`: within FAIL_HOLD_S). Over an episode
+-- being watched the press also runs what `p` did (its pause, by default), so the episode stops while the viewer
+-- chooses, unless the episode is paused already (`pause`): that command would resume it behind the picker; otherwise (a paused one in a hidden window, an ended one sought back, the line's hold over) `p` only does
+-- what it did. `mp.command` runs that command as input.conf would, OSD included (man mpv 0.41). The Service's IPC
+-- target is `omaanime` (Service.qml's IpcHandler).
 mp.register_script_message("picker-key", function(restore)
     poll_play_status()       -- the entry as it is now, not as the last tick read it
     local e = play_entry
     local lent = type(e) == "table" and e.state == "failed" and type(e.detail) == "table" and e.detail.picker == true
     local watched = not nothing_watched()
-    local opens = lent and not watched
+    local _, line = background_text()
+    local over_line = lent and watched and line == "failed"
+    local opens = lent and (not watched or over_line)
+    local paused = mp.get_property_native("pause") == true
+    local ran_saved = not opens or (watched and not paused)
     local saved = (type(restore) == "string" and restore ~= "") and restore or "ignore"
-    local reason = opens and "the refused play lent p and nothing is watched"
+    local reason = (opens and not watched) and "the refused play lent p and nothing is watched"
+                   or (over_line and not paused and "a background refusal's corner line is up: the picker opens, and "
+                                                    .. "p does what it did over the episode being watched")
+                   or (over_line and "a background refusal's corner line is up: the picker opens; the episode is "
+                                     .. "paused already, so what p did is not run (it would resume it)")
                    or (lent and "an episode is being watched: p does what it did"
                        or "the entry is not a refusal that lent p: p does what it did")
     local spawn = nil
@@ -2091,9 +2110,8 @@ mp.register_script_message("picker-key", function(restore)
         local res = mp.command_native(cli_command({ detach = true,
                                                     head = { "omarchy-shell", "omaanime", "refusedPicker" } }))
         spawn = res and res.status
-    else
-        mp.command(saved)
     end
+    if ran_saved then mp.command(saved) end
     -- The press is logged under the refused play's trace (the Service's `ui.picker.summon` names it too).
     local trace = type(e) == "table" and tostring(e.trace or "") or ""
     if trace == "" then trace = string.format("mpv-picker-%d", os.time()) end
@@ -2103,7 +2121,9 @@ mp.register_script_message("picker-key", function(restore)
     end
     if opts.bin == "" then return end
     local data = { decided = opens and "picker" or "restore", reason = reason, restores = saved, lent = lent,
-                   watched = watched, state = type(e) == "table" and e.state or nil,
+                   watched = watched, line = line, paused = paused, ran_saved = ran_saved,
+                   background = type(e) == "table" and e.background == true or false,
+                   state = type(e) == "table" and e.state or nil,
                    mediaId = type(e) == "table" and e.mediaId or nil, episode = type(e) == "table" and e.episode or nil,
                    spawn = spawn }
     local json = utils.format_json(data)

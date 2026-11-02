@@ -1217,10 +1217,10 @@ def picker_key_ready(mpv) -> bool:
         return False
 
 
-def arm_picker_key(mpv, log: Log, media_id: int, episode: int, stage: str = "") -> dict:
+def arm_picker_key(mpv, log: Log, media_id: int, episode: int, stage: str = "", background: bool = False) -> dict:
     if not picker_key_ready(mpv):
         log.info("player.picker_key", "arm", result="SKIP", stage_failed=stage, mediaId=int(media_id),
-                 episode=int(episode), key=PICKER_KEY, ready=PICKER_READY,
+                 episode=int(episode), background=background, key=PICKER_KEY, ready=PICKER_READY,
                  reason="the running player predates its script: it cannot handle the press",
                  suggest="`omarchy-anime player restart` loads it; until then p stays what it was and the popout's "
                          "Choose a release opens the picker")
@@ -1236,7 +1236,7 @@ def arm_picker_key(mpv, log: Log, media_id: int, episode: int, stage: str = "") 
     bound = picker_binding(saved["cmd"])
     mpv.command("keybind", PICKER_KEY, bound)
     log.info("player.picker_key", "arm", result="PASS", stage_failed=stage, mediaId=int(media_id),
-             episode=int(episode), key=PICKER_KEY, cmd=bound, restores=saved["cmd"])
+             episode=int(episode), background=background, key=PICKER_KEY, cmd=bound, restores=saved["cmd"])
     return {"armed": True, "key": PICKER_KEY, "restores": saved["cmd"]}
 
 

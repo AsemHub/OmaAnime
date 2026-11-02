@@ -632,14 +632,31 @@ _SEASON_WORDS_OTHER = (("temporadas?", "temporadas"), ("saisons?", "saisons"), (
 _SIBLING_FORMAT = re.compile(r"^(?:cap[ií]tulos?|epis[oó]dios?|episodi|[eé]pisodes?|folgen?|odcinek|odcink[ai]"
                              r"|b[oö]l[uü]m|t[aậ]p|afleverings?|серии|серия"
                              r"|" + "|".join(word for word, _ in _SEASON_WORDS_OTHER) +
-                             r"|movies?|films?|ovas?|oav|oad|specials?|tvsp|ncop|nced|recaps?|vol|volumes?|arc)$")
+                             r"|movies?|films?|ovas?|oav|oad|specials?|tvsp|ncop|nced|recaps?|vol|volumes?|arc"
+                             # The extras words `_EXTRA_FILE` and the pack identity's `_ID_EXTRA_WORDS` read (a
+                             # `… Complete Series v2 + Specials & Extras` counted `extras` as a show).
+                             r"|extras?|bonus|previews?|trailers?|creditless|menus?)$")
 
 
 def guard_reading(title: str, variants: list[str], movie: bool = False, own=()) -> tuple[str | None, list[list[str]]]:
     """`(name, set_aside)` for the ambiguity check: `sibling_name`'s name without an episode or format
     word (`_SIBLING_FORMAT`) and without a word of any of the entry's own
     titles (`own`, `cli.entry_titles`: AniList's synonyms past the two `variants` holds name its arcs and subtitles,
-    `Shisho ni Naru Tame ni wa…`); `set_aside` is `[word, why]` for each word left out, for the trace."""
+    `Shisho ni Naru Tame ni wa…`); `set_aside` is `[word, why]` for each word left out, for the trace.
+    A pack that holds the entry's own episodes beside other shows (`own_holding_pack`) names no sibling."""
+    name, aside = guard_words(title, variants, movie, own)
+    held = own_holding_reading(title, variants, movie, own) if name else None
+    if held is not None:
+        # The cut, the mark and the show test's score, so a wrongly cleared sibling can be read from the log.
+        return None, [*aside, [name, f"{OWN_HOLDING_WHY} (head {held['head'].strip()!r}, mark {held['mark']!r}, "
+                                     f"similarity {held['similarity']:.2f} to {held['matched']!r})"]]
+    return name, aside
+
+
+def guard_words(title: str, variants: list[str], movie: bool = False, own=()) -> tuple[str | None, list[list[str]]]:
+    """`guard_reading` before its own-holding rule: the words a name gives besides the entry's own and the format
+    words, whether or not the pack also holds the entry. The pack file pick asks it whether a pack names more than the
+    entry (`multi_show_pack`)."""
     name = sibling_name(title, variants, movie)
     if not name:
         return None, []
@@ -657,6 +674,66 @@ def guard_reading(title: str, variants: list[str], movie: bool = False, own=()) 
         else:
             kept.append(w)
     return " ".join(kept) or None, aside
+
+
+# An own-holding pack: the entry's own name first, then other shows after a bundle mark. `+`/`&` outside the
+# `[..]`/`【..】` tags (the bundle reading's, `_bundle_outside_tags`), or a spaced dash once the name before it states a
+# pack (`[Grp] Show (Complete Series) … - Show 0 Zero - OVAs`): a bare `Show - Arc` dash is a show's own name too
+# often (`[Grp] Show - 3-nen Z-gumi Arc-sensei (01-12)`: measured, it cleared real other shows).
+_OWN_HOLDING_DASH = re.compile(r"\s-\s")
+_OWN_HOLDING_PACK = re.compile(r"\b(?:complete|batch)\b", re.I)
+# A number the head states on its own (not a year, not glued to a letter or a dot: `v2`, `S01`, `.170` are not read).
+_OWN_HOLDING_NUMBER = re.compile(r"(?<![\w.])(\d{1,3})(?![\w.])")
+OWN_HOLDING_WHY = ("an own-holding pack: its name before the first bundle mark is the entry's own, so the other "
+                   "shows after it are bundled beside the entry's episodes")
+
+
+def own_holding_cut(title: str) -> tuple[str, str] | None:
+    """`(head, mark)`: the name before its first bundle mark, and the mark (`+`, `&`, or `-` for the dash). The mark
+    is `+`/`&` outside its bracket tags (a tag holding an OVA word is read, as `_bundle_outside_tags` reads it), or a
+    spaced dash once the name before it states a pack (`complete`, `batch`). None without one, or with nothing before
+    it."""
+    t = str(title or "")
+    blanked = _BRACKET_TAG.sub(lambda m: m.group(0) if any(_OVA_WORD.match(w) for w in _title_tokens(m.group(0)))
+                               else " " * len(m.group(0)), t)
+    marks = [(m.start(), m.group(0)) for m in (_FILM_BUNDLE.search(blanked),) if m]
+    marks += [(m.start(), "-") for m in _OWN_HOLDING_DASH.finditer(blanked)
+              if _OWN_HOLDING_PACK.search(t[: m.start()])][:1]
+    cut, mark = min(marks, default=(None, None))
+    return (t[:cut], mark) if cut is not None and t[:cut].strip() else None
+
+
+def own_holding_head(title: str) -> str | None:
+    """The name before its first bundle mark (`own_holding_cut`), else None."""
+    cut = own_holding_cut(title)
+    return cut[0] if cut else None
+
+
+def own_holding_pack(title: str, variants: list[str], movie: bool = False, own=()) -> str | None:
+    """The head of an own-holding pack (`own_holding_reading`), else None."""
+    held = own_holding_reading(title, variants, movie, own)
+    return held["head"] if held else None
+
+
+def own_holding_reading(title: str, variants: list[str], movie: bool = False, own=()) -> dict | None:
+    """How a pack that holds the entry's own episodes beside other shows reads, else None: its head (`own_holding_cut`)
+    gives no guard name (`guard_words`), passes the show test, and states no number none of the entry's titles
+    (`variants`, `own`) holds. `[G] Show Complete Series + Specials & Extras` and `[G] Show (Complete Series) - Show
+    Zero - OVAs` are the entry's; `[Grp] Show (2023) (Season 4 Part 03+04) … Kouhen` states `4` and `03`, which the
+    entry's titles do not, and stays a sibling, as does `Show Zero (Complete Series) - OVA`, whose head is another's.
+    The reading is `{"head", "mark", "similarity", "matched"}`: the cut, its mark, and the show test's score with the
+    entry title it matched (`series_similarity`)."""
+    cut = own_holding_cut(title)
+    if cut is None or guard_words(cut[0], variants, movie, own)[0] is not None:
+        return None
+    head, mark = cut
+    similarity, matched = series_similarity(head, variants)
+    if similarity < SERIES_SIMILARITY:
+        return None
+    titles = (*(variants or ()), *(own or ()))
+    held = {int(n) for t in titles for n in re.findall(r"\d{1,3}", str(t))}
+    said = {int(n) for n in _OWN_HOLDING_NUMBER.findall(_BRACKET_TAG.sub(" ", head))}
+    return None if said - held else {"head": head, "mark": mark, "similarity": similarity, "matched": matched}
 
 
 def sibling_name(title: str, variants: list[str], movie: bool = False, every_script: bool = False) -> str | None:
@@ -1101,13 +1178,19 @@ def franchise_words(title: str, episode: int, alt=()) -> tuple[frozenset, int | 
     return (frozenset(), None, False) if span is None else (frozenset(_title_tokens(span)), n, explicit)
 
 
-def _franchise_span(title: str, episode: int, alt=()) -> tuple[str | None, int | None, bool]:
-    """`franchise_words`' reading: `(text, number, explicit)`, the name's text before the marker that states `episode`
-    or an `alt` number (its leading tags, extension and `_` set aside), or `(None, None, False)` when no marker does."""
+def _franchise_text(title: str) -> str:
+    """The text `_franchise_span` reads its marker in: the name without its leading tags and extension, a dotted scene
+    name's dots and every `_` read as spaces."""
     t = _FRANCHISE_LEAD.sub(" ", _name_body(title))
     if t.count(".") >= 3 and " " not in t.strip():
         t = t.replace(".", " ")
-    t = t.replace("_", " ")
+    return t.replace("_", " ")
+
+
+def _franchise_span(title: str, episode: int, alt=()) -> tuple[str | None, int | None, bool]:
+    """`franchise_words`' reading: `(text, number, explicit)`, the name's text before the marker that states `episode`
+    or an `alt` number (its leading tags, extension and `_` set aside), or `(None, None, False)` when no marker does."""
+    t = _franchise_text(title)
     want = {int(episode), *(int(n) for n in alt or ())}
     for m in _FRANCHISE_MARK.finditer(t):
         n = int(next(m.group(g) for g in _FRANCHISE_EPISODE if m.group(g) is not None))
@@ -1130,9 +1213,10 @@ def _franchise_title(text: str) -> frozenset:
     return frozenset(_title_tokens(_DISAMBIGUATOR.sub("", text)))
 
 
-# Why a first-season entry keeps a name that is exactly another franchise show's title.
-FIRST_SEASON_EXACT = ("but a first season reads only a stated part, not an exact title (the exact reading took "
-                      "the ambiguity guard's evidence)")
+# Why a first-season entry keeps a name that is exactly another franchise show's title: it adds no word none of the
+# entry's titles hold, so its words are the entry's own too (a name adding one is read exactly).
+FIRST_SEASON_EXACT = ("but a first season reads an exact title only of a name that adds a word none of its titles "
+                      "hold")
 
 
 class FranchiseReading(NamedTuple):
@@ -1160,9 +1244,9 @@ def franchise_reading(title: str, variants: list[str], shows=(), episode: int = 
     (`franchise_part`, with `titles`, the entry's other titles, beside `variants`), under the same number test; a kept
     name stating a part says why it named no show.
 
-    `exact=False` (a first-season entry's reading) asks only the part reading. A name that is exactly a
-    franchise show's title is kept, and its why says so (`FIRST_SEASON_EXACT`): dropping those took the evidence from
-    the ambiguity guard and played season 3's episode for season 1 (measured 2026-10-04)."""
+    `exact=False` (the reading of a first season's name that adds no word, `cli.first_season_parts`) asks only the
+    part reading. A name that is exactly a franchise show's title is kept, and its why says so (`FIRST_SEASON_EXACT`):
+    its words are the entry's too. A first season's name that adds a word is asked with `exact=True`."""
     words, n, explicit = franchise_words(title, episode, alt)
     near = bool(words) and any(words & _franchise_title(str(rt)) for _, rt, _, _ in shows or ())
     if not shows:
@@ -1333,6 +1417,163 @@ def states_own_season(title: str, season: int | None, titles, shows=(), episode:
     `Show Season 3` entry's."""
     return (season is not None and season_number(title) == season
             and franchise_part(title, titles, shows, episode, alt).show is None)
+
+
+OWN_SEASON_WORDS_TAG = "own-season words rule"     # ends every `own_season_reading` drop reason
+_CJK_SCRIPTS = frozenset({"Han", "Kana", "Hangul"})
+
+
+class OwnSeasonReading(NamedTuple):
+    """What the own-season words rule read in a name stating the entry's own season: `reason`, the drop (starting
+    `franchise_show`, None when kept), `words`, the words it adds before its season statement as written (CJK ones
+    too), and `why`, why it stays (the words test asked and passed)."""
+    reason: str | None
+    words: tuple
+    why: str
+
+
+@functools.lru_cache(maxsize=1)
+def _release_words() -> frozenset:
+    """The words a release adds to a show's name that name no show: its audio, subtitle and language words (the dub
+    reading's vocabulary, `_DUB_LANGUAGE_WORDS`, `_DUB_AUDIO_TOKENS`, `_DUB_SUB_TOKENS`) and `TV`."""
+    return frozenset(w.lower() for w in (*_DUB_LANGUAGE_WORDS, *_DUB_AUDIO_TOKENS, *_DUB_SUB_TOKENS)) | {"tv"}
+
+
+def _year_word(word: str) -> bool:
+    """A four-digit word that reads as a year (`_is_year`): `2014` in `Show 2014 S2 - 01`."""
+    return len(word) == 4 and word.isdecimal() and _is_year(int(word))
+
+
+def season_statement_words(title: str, episode: int | None = None, alt=()) -> list[str]:
+    """The words a name writes before its season statement, in order, each once: the text `franchise_words` reads
+    (before the marker stating `episode` or an `alt` number; the whole name, its leading tags set aside, when none
+    does) cut where `season_number`'s statement starts (`_SEASON_STATED`), less its bracketed tags and the source and
+    encoding words (`_SERIES_TAGS`, `_SERIES_NOISE`: `BD`, `Dual-Audio`, `1080p`, `(2020)`), as the show test cuts
+    them, and less its years (`_year_word`: the year side, `later_series_years`, reads those).
+    `[Grp] Tidewater Lantern Driftwood 2nd Season - 01` gives `tidewater lantern driftwood`."""
+    span = _franchise_span(title, episode, alt)[0] if episode is not None else None
+    text = _franchise_text(title) if span is None else span
+    m = _SEASON_STATED.search(text)
+    text = text[:m.start()] if m else text
+    words = _title_tokens(_SERIES_NOISE.sub(" ", _SERIES_TAGS.sub(" ", text)))
+    return list(dict.fromkeys(w for w in words if not _year_word(w)))
+
+
+def later_series_years(title: str, titles, start_year: int | None, end_year: int | None = None) -> tuple[list, int]:
+    """The year side of the own-season rule: `(years, last)`, the years a name gives its series
+    (`extsubs.series_years`) that are later than the entry's last year and that none of its `titles` holds, and that
+    last year (`end_year`, AniList's `endDate`, else `start_year + 1`). `([], 0)` without a start year. A year after
+    the season has ended is another show's (`… | Show (2020) 2nd Season` for a 2015-16 season); every earlier year is
+    kept: the series' first year (`Show (2016) - S05`), the end year (`Show (2025) (Season 3)` for a 2024-25
+    season), and a year a title holds (`Show (2022) 2nd Season`, whose romaji is `Show (2022)`)."""
+    from .extsubs import clean_name, series_years
+    if not start_year:
+        return [], 0
+    last = end_year if end_year else start_year + 1
+    held = {w for t in titles or () for w in _title_tokens(str(t)) if _year_word(w)}
+    return sorted(y for y in series_years(clean_name(title)) if y > last and str(y) not in held), last
+
+
+def own_season_reading(title: str, titles, episode: int | None = None, alt=(), start_year: int | None = None,
+                       tv_series: bool = False, end_year: int | None = None) -> OwnSeasonReading:
+    """Is a name the own-season reading keeps (`states_own_season`) still another show's? It is when it writes, before
+    its season statement, a word that none of the entry's `titles` (`variants` and every AniList title) holds:
+    `[Grp] Tidewater Lantern Driftwood 2nd Season - 01` is the `Driftwood` arc's second season, not
+    `Tidewater Lantern 2nd Season`'s. The words are `season_statement_words` (no year among them), each folded
+    (`_fold_marks`) and compared with the titles' `_franchise_title` and `_title_tokens` words. Not added: a release's
+    language, audio and subtitle words and `TV` (`_release_words`).
+    A set of added words made only of Han, Kana or Hangul words is a translated title put in front
+    (`藥師少女的獨語 第三季 / … 3rd Season - 53`), not another show: kept. Any Latin, digit or other word makes it count.
+
+    For a TV series (`tv_series`) with a known `start_year`, a name giving its series a year after the entry's last
+    year that no title holds (`later_series_years`, with `end_year`) is another show too: a movie or a one-episode
+    entry is never asked. Read only of names the caller found stating the entry's own season, singles and packs
+    alike."""
+    own: set = set()
+    for t in titles or ():
+        own |= {_fold_marks(w) for w in (*_franchise_title(str(t)), *_title_tokens(str(t)))}
+    skip = _release_words()
+    words = tuple(w for w in season_statement_words(title, episode, alt) if _fold_marks(w) not in own and w not in skip)
+    if words and not all(_scripts(w) and _scripts(w) <= _CJK_SCRIPTS and not any(c.isdigit() for c in w)
+                         for w in words):
+        return OwnSeasonReading(f"{FRANCHISE_SHOW} adds \"{' '.join(words)}\" before its season statement, which no "
+                                f"title of the entry holds: another show of the franchise ({OWN_SEASON_WORDS_TAG})",
+                                words, "")
+    later, last = later_series_years(title, titles, start_year, end_year) if tv_series else ([], 0)
+    if later:
+        return OwnSeasonReading(f"{FRANCHISE_SHOW} states the year {', '.join(map(str, later))} for its series, after "
+                                f"the entry's last year {last}: another show of the franchise "
+                                f"({OWN_SEASON_WORDS_TAG})", words, "")
+    why = (f"adds only CJK words before its season statement, a translated title ({' '.join(words)})" if words else
+           "adds no word before its season statement")
+    return OwnSeasonReading(None, words, why + (f"; no year after the entry's last year {last}" if last else ""))
+
+
+FIRST_SEASON_SHOW_TAG = "first-season show rule"   # ends every first-season exact-title drop reason
+
+
+def first_season_added_words(title: str, titles, episode: int | None = None, alt=()) -> tuple:
+    """The words a first season's name adds to the entry's `titles` (`variants` and every AniList title), by the
+    own-season words rule's reader (`own_season_reading`, no year asked): `season_statement_words` none of the titles
+    hold, release words left out, and () when the words it adds are only Han, Kana or Hangul ones (a translated
+    title). `[Grp] Tidewater Lantern 0 - 02` adds `0` for `Tidewater Lantern`. Whether `cli.first_season_parts`
+    reads the franchise, as a stated part does, and which names it asks the exact-title reading."""
+    reading = own_season_reading(title, titles, episode, alt)
+    return reading.words if reading.reason else ()
+
+
+def marked_show(title: str, titles, shows=()) -> tuple[str | None, frozenset]:
+    """`(reason, words)`: a first season's name whose words before its first explicit episode marker (`_FRANCHISE_MARK`,
+    whatever episode it states; the text `_franchise_span` reads) are exactly another franchise show's title, none of
+    the entry's `titles`, with a number within that show's episodes. `[Grp] Tidewater Lantern 0 - 01` is
+    `Tidewater Lantern 0`'s episode 1 when episode 2 is asked: the episode marker's reading (`franchise_reading`) finds
+    no marker for 2, and a one-file torrent plays its only file whatever it is. The reason is None when kept."""
+    t = _franchise_text(title)
+    m = _FRANCHISE_MARK.search(t)
+    if m is None:
+        return None, frozenset()
+    n = int(next(m.group(g) for g in _FRANCHISE_EPISODE if m.group(g) is not None))
+    cut = next((m.end(g) for g in _FRANCHISE_SEASON if m.group(g) is not None), m.start())
+    words = frozenset(_title_tokens(t[:cut]))
+    if not words or words in {_franchise_title(str(x)) for x in titles or () if x}:
+        return None, words
+    for rid, rt, _fmt, eps in shows or ():
+        if _franchise_title(str(rt)) == words and (eps is None or n <= int(eps)):
+            return (f"{FRANCHISE_SHOW} names {rid} ({rt}) as written, with its episode {n}"
+                    f"{f' of {eps}' if eps is not None else ''}, before the name's first episode marker: no more than "
+                    f"that show's title ({FIRST_SEASON_SHOW_TAG})"), words
+    return None, words
+
+
+class FirstSeasonPack(NamedTuple):
+    """What `first_season_show_pack` read: `reason` (the drop, None when kept), `words` (the whole name's, its ranges
+    set aside) and `near` (they share a word with a franchise title: a kept pack the log should show)."""
+    reason: str | None
+    words: frozenset
+    near: bool
+
+
+def first_season_show_pack(title: str, titles, shows=()) -> FirstSeasonPack:
+    """What a first season's pack is: dropped (`franchise_show`) when its whole-name words
+    (`season_statement_words` with no episode), its own ranges set aside (`pack_range_matches`, the ranges the
+    prefilter reads: `Show 0 - 01 ~ 23`'s `01 ~ 23`, not `pack_range_search`'s `0 - 01`), are exactly the
+    title of a show in `shows` (`anilist.franchise_shows`, `_franchise_title`), and are none of the entry's `titles`.
+    A show titled as one of the entry's titles is never named (`SLAM DUNK (Movie)` reads as `Slam Dunk`).
+    `[Grp] Tidewater Lantern 0 (01-23) [Batch]` is `Tidewater Lantern 0`'s pack; `[Grp] Tidewater Lantern - 01 ~ 64` is
+    the entry's own. The reason is None when the pack is kept."""
+    text = str(title or "")
+    for m in reversed(pack_range_matches(text)):
+        text = f"{text[:m.start()]} {text[m.end():]}"
+    words = frozenset(season_statement_words(text))
+    own = {_franchise_title(str(t)) for t in titles or () if t}
+    near = bool(words) and any(words & _franchise_title(str(rt)) for _, rt, _, _ in shows or ())
+    if not words or words in own:
+        return FirstSeasonPack(None, words, near)
+    for rid, rt, _fmt, _eps in shows or ():
+        if _franchise_title(str(rt)) == words:
+            return FirstSeasonPack(f"{FRANCHISE_SHOW} names {rid} ({rt}): the pack's words, its ranges set aside, are "
+                                   f"that show's title and none of the entry's ({FIRST_SEASON_SHOW_TAG})", words, True)
+    return FirstSeasonPack(None, words, near)
 
 
 FIRST_SEASON_TAG = "first-season rule"  # ends every `first_season_reason`, so a log can pick its drops out of a sink
@@ -1663,6 +1904,12 @@ FILE_NUMBER_NOT_EPISODE = "number_not_episode"
 # episode says is another (`S02E05` for 11061's episode 5, which is TVDB's `S1E5`), or no pair is known. `against` is
 # the part read. Not an identity refusal either.
 FILE_SEASON_RELATIVE = "season_relative"
+# A first season's file in a pack naming more than the entry (`first_season_file_check`): another show of
+# its franchise by its name (`against`: the reason), a season the entry is not (`against`: the seasons), a file under an
+# extras folder (`against`: the folder).
+FILE_FRANCHISE_SHOW = "franchise_show"
+FILE_OTHER_SEASON = "other_season"
+FILE_EXTRAS_FOLDER = "extras_folder"
 # How an entry title was met in a name (`entry_named`, the picked record's `identity["met_by"]`).
 MET_AS_WRITTEN = "as_written"            # its words and numbers, and any season it states, in any spelling
 MET_BY_TITLE_NUMBER = "title_number"     # its trailing number, met by an ordinal (`2nd Season`)
@@ -1867,6 +2114,89 @@ def pack_file_check(entry: dict | None, pack_title: str = ""):
     return check
 
 
+def multi_show_pack(pack_title: str, titles, own=()) -> bool:
+    """Does a pack name more than the entry? An own-holding pack (`own_holding_pack`: other shows after a bundle mark),
+    or one whose name gives the guard words besides the entry's own (`guard_words`). Decided without the franchise, so
+    it says when a first season's pick needs it (`first_season_file_check`)."""
+    own = tuple(own or titles or ())
+    return (own_holding_pack(pack_title, list(titles or ()), False, own) is not None
+            or guard_words(pack_title, list(titles or ()), False, own)[0] is not None)
+
+
+def pack_root(names) -> str | None:
+    """The torrent's root folder in a pack's file list: the first path segment, when every listed file sits under it
+    (after RD's leading `/`), else None. TorBox's names carry it (`[Grp] Show Complete + Specials/Show - 02.mkv`, the
+    `torbox.filepick handover` lines and its cached lists), an add-on's list may not (bare names), RD's paths
+    are documented only as starting with `/`: a list with the root or without one reads the same here. A BitTorrent
+    torrent of several files puts every file under its one root, so a first segment not shared by every file is no root
+    (a list without one: `Specials/…` beside `Show/…`) and nothing is dropped. A single listed file under a folder has
+    that folder dropped too, root or not: one file has no folder to tell apart from."""
+    split = [[p for p in str(n or "").split("/") if p] for n in names]
+    if not split or any(len(p) < 2 for p in split):
+        return None
+    firsts = {p[0] for p in split}
+    return firsts.pop() if len(firsts) == 1 else None
+
+
+def first_season_file_check(entry: dict | None, pack_title: str = "", root: str | None = None):
+    """For a first season's pack that names more than the entry (`multi_show_pack`), `check(path) -> (code, against)`:
+    code None when the file may be the entry's episode, else why it is not. Off (None) for a later season (its own rule,
+    `pack_file_check`), a movie, a single-show pack, and an entry that carries no franchise shows
+    (`entry["first_season_shows"]`, `cli.first_season_franchise`: none read, or the read failed): there the file is
+    picked by its number, as before. A file is set aside when
+    - it sits under a folder `_EXTRA_FILE` reads (`Specials/`, `Extras/`, `NCOP/`): `extras_folder`;
+    - it states a season the entry is not (`S02E02`, `Season 2/`, read as `identity_tokens` reads one), when ani.zip
+      files the entry's episode 1 (`entry["episode1"]`) and numbers it in one TVDB season (no `season_map`):
+      `other_season`;
+    - its name, or its folder's, is another franchise show's (`franchise_reading`, `marked_show`,
+      `first_season_show_pack`, with the entry's own titles, `entry["own_titles"]`): `franchise_show`.
+    The folders read are those below the torrent's root (`root`, `pack_root`): the root is the pack's own name, and an
+    own-holding pack's name says what it bundles (`… + Specials & Extras`, `S1+S2`, `… + Show 0`), so read as a folder
+    it set every own file aside."""
+    entry = entry or {}
+    shows = tuple(tuple(s) for s in entry.get("first_season_shows") or ())
+    if entry.get("sequel") or entry.get("movie") or not shows:
+        return None
+    titles = list(entry.get("titles") or [])
+    own = tuple(entry.get("own_titles") or titles)
+    if not multi_show_pack(pack_title, titles, own):
+        return None
+    ep1 = entry.get("episode1")
+    own_season = ep1[0] if ep1 and not entry.get("season_map") else None
+
+    def check(path: str, episode: int, alt=()) -> tuple[str | None, str | None]:
+        parts = [p for p in str(path or "").split("/") if p]
+        if root is not None and len(parts) > 1 and parts[0] == root:
+            parts = parts[1:]
+        folders, base = parts[:-1], (parts or [""])[-1]
+        stem = base.rsplit(".", 1)[0] if base.lower().endswith(VIDEO_EXT) else base
+        folder = next((d for d in folders if _EXTRA_FILE.search(d)), None)
+        if folder is not None:
+            return FILE_EXTRAS_FOLDER, folder
+        if own_season is not None:
+            seasons = set().union(*(identity_tokens(p)[1] for p in [*folders, stem]))
+            if seasons - {own_season}:
+                return FILE_OTHER_SEASON, f"season {', '.join(map(str, sorted(seasons)))} wanted {own_season}"
+        why = (franchise_reading(stem, titles, shows, episode, alt, own).reason
+               or marked_show(stem, own, shows)[0]
+               or next((r for r in (first_season_show_pack(d, own, shows).reason for d in folders[-1:]) if r), None))
+        if why:
+            return FILE_FRANCHISE_SHOW, why
+        return None, None
+    return check
+
+
+def set_aside_words(skipped: list[dict], sample: int = 3) -> str:
+    """The files a first season's pick set aside (`first_season_file_check`'s codes), in the viewer's words, for a
+    refusal's message: `Show 0 - 02.mkv (another show of the franchise), Specials/Show - 02.mkv (an extras folder)`;
+    empty when none was."""
+    said = {FILE_FRANCHISE_SHOW: "another show of the franchise", FILE_OTHER_SEASON: "another season",
+            FILE_EXTRAS_FOLDER: "an extras folder"}
+    rows = [f"{s['path']} ({said[s['code']]})" for s in skipped if s.get("code") in said]
+    more = len(rows) - sample
+    return ", ".join(rows[:sample]) + (f" and {more} more" if more > 0 else "")
+
+
 def season_relative_seasons(season_map: dict | None, readings: Iterable[EpisodeReading]) -> dict | None:
     """Which seasons a pack counts from 1, for an entry ani.zip numbers on across TVDB seasons
     (`season_map`, `anizip.season_map`; None for any other entry, and then None). `from_1`: each season code after the
@@ -1993,6 +2323,14 @@ def pick_episode_file(files: list[dict], episode: int, alt: list[int] | None = N
     first season, the rule is today's. The picked record carries `identity`: how it was accepted
     (`rule`, `title`, and `met_by`: how that title was met).
 
+    A first season's pack that names more than the entry is read whole (`first_season_file_check`): a file of
+    another franchise show, another season or an extras folder goes to `skipped` with its code, and among the files left
+    holding the episode one whose name gives the guard no word of its own (`guard_reading`) wins over the list's order
+    (`Show Zero - 02` loses to `Show - 02`). Its `identity` is `{"rule": "first_season", "franchise"` (where the shows
+    came from, `entry["first_season_from"]`), `"set_aside"`, `"left"` (the files left holding the episode),
+    `"preferred"` (the pick was not the first of them) and `"root"` (the torrent's root folder the folder tests read
+    below, `pack_root`)`}`.
+
     A file's episode is its name's episode marker (`episode_reading`, after the entry titles that hold a
     number are cut out), not any number of the name: `Lantern Zoku 2 - 08` is episode 8 for `Lantern Zoku 2`. The
     picked record carries `read` (`EpisodeReading.as_log`: the tier, the part read, the numbers, the titles cut); a file
@@ -2012,6 +2350,9 @@ def pick_episode_file(files: list[dict], episode: int, alt: list[int] | None = N
         return pick_movie_file(files, entry)
     alts = [int(a) for a in (alt or []) if a is not None and int(a) != int(episode)]
     check = pack_file_check(entry, pack_title)
+    root = pack_root(f.get("name") or f.get("filename") or f.get("path") or f.get("short_name") or ""
+                     for f in files or [])
+    first = None if check is not None else first_season_file_check(entry, pack_title, root)
     titles = list((entry or {}).get("titles") or [])
     season_map = (entry or {}).get("season_map")
     pair, shared = episode_pair(season_map, episode) if season_map else (None, False)
@@ -2031,6 +2372,14 @@ def pick_episode_file(files: list[dict], episode: int, alt: list[int] | None = N
     # Only a season map needs the whole pack read first (which seasons count from 1);
     # any other entry's files are read one by one, and reading stops at the episode's, as before.
     listed = list(read_files()) if season_map else read_files()
+    hits: list[dict] = []          # a first season's files left holding the episode (`first`), then its absolutes
+    absolutes: list[dict] = []
+
+    def left(name: str, base: str) -> bool:
+        code, against = first(name.rsplit(".", 1)[0], int(episode), alts)
+        if code and skipped is not None:
+            skipped.append({"path": name, "file": base, "code": code, "against": against})
+        return code is None
     count = season_relative_seasons(season_map, [reading for *_, reading in listed]) if season_map else None
 
     def accepted(name: str, base: str, path: str) -> dict | None:
@@ -2053,11 +2402,19 @@ def pick_episode_file(files: list[dict], episode: int, alt: list[int] | None = N
                                 "read": read})
             continue
         if int(episode) in numbers:
+            if first is not None:
+                if left(name, base):
+                    hits.append({**f, "basename": base, "index": idx, "matched": "episode", "read": read})
+                continue
             ident = accepted(name.rsplit(".", 1)[0], base, name)
             if ident is not None:
                 return {**f, "basename": base, "index": idx, "matched": "episode", "identity": ident, "read": read}
             continue
         if alts and numbers & set(alts):
+            if first is not None:
+                if left(name, base):
+                    absolutes.append({**f, "basename": base, "index": idx, "matched": "absolute", "read": read})
+                continue
             if fallback is None:
                 ident = accepted(name.rsplit(".", 1)[0], base, name)
                 if ident is not None:
@@ -2067,6 +2424,18 @@ def pick_episode_file(files: list[dict], episode: int, alt: list[int] | None = N
         if skipped is not None and title_matches_episode(stem, episode, alts, any_number=True):
             skipped.append({"path": name, "file": base, "code": FILE_NUMBER_NOT_EPISODE, "against": reading.part,
                             "read": reading.as_log()})
+    if first is not None:
+        pool = hits or absolutes
+        if not pool:
+            return None
+        own = tuple((entry or {}).get("own_titles") or titles)
+        best = next((h for h in pool if guard_reading(h["basename"].rsplit(".", 1)[0], titles, False, own)[0] is None),
+                    pool[0])
+        aside = sum(1 for x in skipped or () if x["code"] in (FILE_FRANCHISE_SHOW, FILE_OTHER_SEASON,
+                                                              FILE_EXTRAS_FOLDER))
+        return {**best, "identity": {"rule": "first_season", "franchise": (entry or {}).get("first_season_from"),
+                                     "set_aside": aside, "left": len(pool), "preferred": best is not pool[0],
+                                     "root": root}}
     return fallback
 
 
@@ -3142,8 +3511,8 @@ _PACK_RANGE_LABEL = re.compile(_RANGE_LABELS + r"\s*$", re.I)          # beside 
 _PACK_RANGE_LABEL_HEAD = len("volume.")      # its longest label, before the run of whitespace (`_before_window`)
 
 
-def pack_ranges(title: str) -> list[tuple[int, int]]:
-    """The episode ranges a release title names; [] when it names none."""
+def pack_range_matches(title: str) -> list[re.Match]:
+    """`pack_ranges`' matches, each the text of one episode range a release title names (`01-23`, `01 ~ 23`)."""
     out = []
     t = str(title or "")
     for m in _PACK_RANGE.finditer(t):
@@ -3152,8 +3521,13 @@ def pack_ranges(title: str) -> list[tuple[int, int]]:
         if lo > hi or hi >= 1900 or _PACK_RANGE_LABEL.search(
                 t, _before_window(t, m.start(), "", _PACK_RANGE_LABEL_HEAD), m.start()):
             continue
-        out.append((lo, hi))
+        out.append(m)
     return out
+
+
+def pack_ranges(title: str) -> list[tuple[int, int]]:
+    """The episode ranges a release title names; [] when it names none."""
+    return [(int(m.group(1)), int(m.group(2))) for m in pack_range_matches(title)]
 
 
 def pack_range_excludes(cand: dict, parsed: dict, episode: int | None, alt: list[int] | None = None) -> bool:

@@ -115,6 +115,9 @@ QUERY = (
           "caps); query.matches reads them."),
     Field(("tv_series",), "query.tv_series", "True when the entry is a TV series: query.matches then drops a "
           "single that states an OVA no title of the entry holds."),
+    Field(("start_year", "end_year"), "query.start_year, query.end_year", "for a TV series, the years AniList "
+          "says it started and ended, or None: with franchise_shows, query.matches drops a name stating the entry's "
+          "own season that gives its series a year after the entry's last year (end_year, else start_year + 1)."),
     Field(("pack_pass",), "query.pack_pass", "True on the second pass, asked only when the first found fewer "
           "than three releases with people sharing them and packs are allowed: look for packs."),
     Field(("known",), "query.known", "the infohashes earlier add-ons already returned in this search. You may "
@@ -154,9 +157,10 @@ RELEASE = (
           "ranking)."),
 )
 
-# The plugin's own parts of an episode query, which an add-on never reads.
+# The plugin's own parts of an episode query, which an add-on never reads (the built-in Torznab add-on, the
+# plugin's own, asks `own_season_reading` and `own_season_reason` on its pack pass).
 QUERY_INTERNAL = ("rejected", "for_call", "part_kept", "first_season_reason", "first_season_read",
-                  "first_season_kept")
+                  "first_season_kept", "own_season_reading", "own_season_reason")
 
 # The add-on guide's example add-on, word for word: the test suite also loads it through the plugin's registry.
 EXAMPLE = '''\
