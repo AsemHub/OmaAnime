@@ -65,6 +65,9 @@ Item {
   property bool parked: false
   property string subLang: ""
   property var nowPlaying: null         // now-playing.json or null
+  // The episode the player last had loaded, `{mediaId, episode, at}` (`at`: when this Service first saw it, ms), kept
+  // after the player closes: Browse's episode cursor follows it (`Model.cursorAfterPlay`).
+  property var lastPlayed: null
   property var resume: null
   property var settings: ({})          // the effective merge: defaults < config.json < shell.json
   property var settingsSource: ({})    // per key: "default" | "config" | "shell"
@@ -1609,6 +1612,10 @@ Item {
           : ""
         root.subLang = s["current-tracks/sub/lang"] ? String(s["current-tracks/sub/lang"]) : ""
         root.nowPlaying = s.nowPlaying && typeof s.nowPlaying === "object" ? s.nowPlaying : null
+        var np = root.nowPlaying, lp = root.lastPlayed
+        if (np && Number(np.mediaId) > 0 && Number(np.episode) > 0
+            && !(lp && lp.mediaId === Number(np.mediaId) && lp.episode === Number(np.episode)))
+          root.lastPlayed = { mediaId: Number(np.mediaId), episode: Number(np.episode), at: Date.now() }
         root.resume = s.resume && typeof s.resume === "object" ? s.resume : null
         if (s.settings && typeof s.settings === "object") root.settings = s.settings
         if (s.settingsSource && typeof s.settingsSource === "object") root.settingsSource = s.settingsSource

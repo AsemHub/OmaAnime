@@ -425,14 +425,17 @@ def original_language_words(original: str | None) -> str:
 
 
 def wait_headline(show: str | None, episode, original: str | None, held: bool = False, reading: dict | None = None,
-                  nothing_cached: bool = False, added_dub: str | None = None) -> str:
+                  nothing_cached: bool = False, added_dub: str | None = None, picked: bool = False) -> str:
     """The choice's first sentence: TorBox has only a dub, and what it is doing with the original-audio copy. Held, the
     second sentence follows TorBox's last reading (a stalled download is not "still downloading"). `nothing_cached`:
     TorBox has no copy of the episode at all, so the sentence names no language (one would imply another it has).
     `added_dub`: the one download is itself a dub (`dubs=allow`, or every release a dub), named by its language ("" for
-    an unknown one), so the viewer knows before "ready in English" what they are waiting for."""
+    an unknown one), so the viewer knows before "ready in English" what they are waiting for. `picked`: the viewer
+    chose this release in the picker, which may have shown another release of the episode ready at TorBox: the
+    sentence names their choice, never the episode."""
     what = f"{show} episode {episode}" if show else f"episode {episode}"
-    first = (f"TorBox doesn't have {what} yet." if nothing_cached
+    first = ("TorBox doesn't have the release you chose yet." if picked else
+             f"TorBox doesn't have {what} yet." if nothing_cached
              else f"TorBox doesn't have {what} {original_language_words(original)} yet.")
     it = "it" if added_dub is None else (f"the {added_dub} dub" if added_dub else "the dub")
     if not held:
@@ -790,8 +793,17 @@ _REJECTED = {
 }
 
 
-def rejected_why(code: str, detail: str | None = None) -> str:
-    """The viewer's words for one rejected release; `detail` names the other show."""
+# A `series` row whose title names no other show (`searches.row`'s `show` is empty): its name does not name the
+# entry, and nothing says what it is instead, so "another show" would be a guess; for a name of the show the reading
+# misses (`[Grp] Lantern S03E20 (Harbor Arc)` for a later season's episode 8) it is untrue.
+NOT_NAMED = "does not name the show"
+
+
+def rejected_why(code: str, detail: str | None = None, named: bool = True) -> str:
+    """The viewer's words for one rejected release; `detail` names the other show. `named`: a `series` row's title
+    names another show (`searches.row`'s `show`); without one the words say only that it does not name this one."""
+    if code == "series" and not named:
+        return NOT_NAMED
     words = _REJECTED.get(code, "not usable")
     if code == "other_show" and detail:
         return f"{words}: {detail.title()}"

@@ -3117,8 +3117,11 @@ def _resolve(args, log: Log, settings: dict, dry_run: bool, ranked_sink: list | 
                     # nothing cached or "Keep waiting" from a hold that offered no dub (`--wait` without `--dub`).
                     no_dub_on_offer = dub_held is None and (nothing_cached or (
                         keep_waiting and not getattr(args, "dub", None)))
+                    # A viewer's pick (the pin's rule: not "Keep waiting", not a stopgap) is the one release this play
+                    # ranked, so "nothing cached" says nothing of the episode's other releases: the words name the pick.
+                    viewer_pick = bool(picked and not keep_waiting and not getattr(args, "no_pin", False))
                     facts = choice_facts(http, log, args, settings, cand, stream, dub_held, dubs["country"], alt,
-                                         show=series_title, nothing_cached=no_dub_on_offer)
+                                         show=series_title, nothing_cached=no_dub_on_offer, picked=viewer_pick)
                     # Offered only while something can act on it: `wait_for_torbox` puts it on the entry once its
                     # handlers are in place and takes it off before they go; a hold puts it back (`Held`). "Keep
                     # waiting" from a hold already answered the question: that wait offers it confirmed (no sentence,
@@ -3706,10 +3709,11 @@ def added_audio(cand: dict, country) -> str | None:
 
 
 def choice_facts(http: Http, log: Log, args, settings: dict, cand: dict, stream: dict, dub_held, country, alt,
-                 show: str | None = None, nothing_cached: bool = False) -> dict:
+                 show: str | None = None, nothing_cached: bool = False, picked: bool = False) -> dict:
     """What the viewer's choice is about, once, when this play's one uncached add was made: in place of a held dub,
     or with nothing cached at all (`nothing_cached`). The audio language of the release TorBox is downloading
-    (`added_audio`), that release, the dub and its subtitles."""
+    (`added_audio`), that release, the dub and its subtitles. `picked`: the viewer chose that release in the picker, so
+    the sentence names it, not the episode (another release of it may be cached)."""
     original = added_audio(cand, country)
     dub = None
     if dub_held is not None:
@@ -3718,7 +3722,7 @@ def choice_facts(http: Http, log: Log, args, settings: dict, cand: dict, stream:
                "lang": words["lang"], "group": words["group"], "resolution": words["resolution"],
                "subtitles": dub_subtitles(http, log, dub_held[0], settings, args, alt)}
     facts = {"original": original, "country": country, "dub": dub, "show": show or None,
-             "nothingCached": bool(nothing_cached),
+             "nothingCached": bool(nothing_cached), "picked": bool(picked),
              # The one download is itself a dub: its language ("" when its name does not say), else None.
              "addedDub": (_dub_language(cand.get("dub_words")) or "") if cand.get("dub_words") else None,
              "release": {"infoHash": str(cand.get("info_hash") or "").lower(), "title": cand.get("title"),
@@ -3765,7 +3769,8 @@ def wait_choice(args, facts: dict, held: bool, reading: dict | None = None, conf
                     "ack": saymod.later_line(args.episode)})
     headline = "" if confirmed and not held else saymod.wait_headline(
         facts.get("show"), args.episode, facts.get("original"), held=held, reading=reading,
-        nothing_cached=bool(facts.get("nothingCached")), added_dub=facts.get("addedDub"))
+        nothing_cached=bool(facts.get("nothingCached")), added_dub=facts.get("addedDub"),
+        picked=bool(facts.get("picked")))
     out = {"headline": headline, "held": held, "confirmed": bool(confirmed and not held),
            "nothingCached": bool(facts.get("nothingCached")),
            "original": facts.get("original"), "subtitles": (dub or {}).get("subtitles"), "dub": dub,
@@ -4026,8 +4031,9 @@ def text_search(reg, http: Http, log: Log, words: str, settings: dict, movie: bo
 
 def query_releases(args, log: Log, settings: dict, reg) -> None:
     """The picker's `/`. The viewer's words go, as typed, to every add-on offering text search
-    (`text_search`). They skip the "is this the right show" test — the viewer chose them
-    — and keep the episode test only as a label, so a pack or a mis-numbered title stays pickable.
+    (`text_search`). What they find is asked the show and season test as a plain search's is (the viewer chose the
+    words, not the releases): another show's or season's name is ruled out with that reason, so its pick
+    asks. The episode test is only a label, so a pack or a mis-numbered title of the show stays pickable.
     The result replaces the stored list; the raw releases of the previous search are kept, so a row
     picked from either still plays."""
     http = Http(log, settings["httpTimeout"])
@@ -4054,8 +4060,19 @@ def query_releases(args, log: Log, settings: dict, reg) -> None:
     # series' `- 60`…`- 87`, `Vigilantes S01E02`…), not only the entry's own releases.
     unstated = search.movie or one_episode_entry(log, args.anilist_id, args.episode, search.movie,
                                                  stage="releases.query")
-    keep, not_episode = [], []
+    # The plain search's show and season test, the episode left out: the words are the viewer's, the
+    # releases they found are not, and a batch skips the episode label, so a batch of any show would pass unasked.
+    # A name of another show or season is ruled out with that reason, and its pick asks (`pickerAsk`, `Picker.ask`).
+    own = entry_titles(args.anilist_id, search.variants)
+    season = entry_season(log, args.anilist_id, search.variants, mapping)
+    keep, not_episode, other = [], [], []
     for rel in releases:
+        ok, why = release_matches_target(rel.get("title", ""), search.variants, args.episode, alt,
+                                         target_season=season, check_episode=False, titles=own)
+        if not ok:
+            search.reject(rel, why.split()[0])
+            other.append([rel.get("title", ""), why])
+            continue
         if (not single and not parse_title(rel.get("title", "")).get("batch")
                 and not title_matches_episode(rel.get("title", ""), args.episode, alt, any_number=unstated)):
             search.reject(rel, "episode", str(args.episode))
@@ -4074,7 +4091,8 @@ def query_releases(args, log: Log, settings: dict, reg) -> None:
     search.save()
     # Each name labelled "not episode N", with how its episode was read.
     log.info("releases.query", "done", result="PASS" if releases else "EMPTY", q=words, found=len(releases),
-             passed=len(search.passed), rejected=len(search.rejected), alt=alt,
+             passed=len(search.passed), rejected=len(search.rejected), alt=alt, season=season,
+             other_show=other[:NOT_EPISODE_LOGGED], other_show_more=max(0, len(other) - NOT_EPISODE_LOGGED),
              not_episode=not_episode[:NOT_EPISODE_LOGGED],
              not_episode_more=max(0, len(not_episode) - NOT_EPISODE_LOGGED))
 
@@ -6749,8 +6767,8 @@ def prefetch_next(log: Log, args, now_playing: dict, pos: float, settings: dict)
     if nxt is None:
         return {"episode": None, "reason": reason}
     # The rest of the episode's ticks find it latched: one read without the lock answers them. The lock decides only
-    # when there is no entry yet (`latch`).
-    seen = prefetchmod.entry(args.anilist_id, nxt)
+    # when there is no entry yet, or only one past the reuse's window (`latch`, `prefetch.holds`).
+    seen = prefetchmod.holding(args.anilist_id, nxt)
     if seen is not None:
         return {"episode": nxt, "reason": f"episode {nxt} was already prefetched ({seen.get('state')})"}
     trace = prefetchmod.new_trace()

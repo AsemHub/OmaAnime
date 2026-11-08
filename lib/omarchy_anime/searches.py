@@ -42,11 +42,12 @@ def row(release: dict, reason: str | None = None, detail: str | None = None,
     ranges = pack_ranges(release.get("title", "")) if parsed.get("batch") else []
     out.update(group=parsed.get("group"), resolution=parsed.get("resolution"), pack=bool(parsed.get("batch")),
                pack_range=list(ranges[0]) if ranges else None,
-               file=(release.get("file") or {}).get("name") if release.get("file") else None,
-               reason=reason, why=saymod.rejected_why(reason, detail) if reason else None)
+               file=(release.get("file") or {}).get("name") if release.get("file") else None)
     # A movie's release without an episode marker names no show (`movie`, from `Search.movie`).
     name = sibling_name(release.get("title", ""), variants, movie) if variants else None
     out["show"] = name.title() if name else None
+    # A `series` row says "another show" only when its title names one.
+    out.update(reason=reason, why=saymod.rejected_why(reason, detail, named=bool(name)) if reason else None)
     return out
 
 

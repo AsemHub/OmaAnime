@@ -316,6 +316,31 @@ def episode_reading(name: str, titles: Iterable[str] = ()) -> EpisodeReading:
 
 _SERIES_GROUP = re.compile(r"^\[[^\]]{1,30}\]\s*")
 _SERIES_TAGS = re.compile(r"[\[\(][^\]\)]{0,40}[\]\)]")
+# A second reading of a name's show part, asked only when the first (`series_part`) is below the bar
+# (`_reread_shows`): `_` as a space (`Tabiji_no_Pellin_01`); a group tag in CJK lenticular brackets
+# (`【Group】[Title][01]`), whose brackets hold tags as `[…]` do; and a name whose show is written only inside its
+# tags (`[Group][Title][01]`, `[Group][中文名/Title][BDRip]`): each bracket after the group tag, each `/`, `／` or `|`
+# alternative of it on its own.
+_REREAD_LEAD = re.compile(r"^(?:\[[^\]]{1,30}\]|【[^】]{1,30}】)\s*")
+_REREAD_CJK_TAGS = re.compile(r"【[^】]{0,40}】")
+_REREAD_BRACKETS = re.compile(r"\[([^\]]{1,120})\]|【([^】]{1,120})】")
+_REREAD_ALTERNATIVES = re.compile(r"\s*[/／|]\s*")
+# Words a re-read show part may hold beside the entry's titles' words and numbers (`_reread_passes`), each met in a
+# right name of the measured corpus (invented here): `Lantern_x_Lantern_06_2011_Full_HD_…_VOSTFR`,
+# `Kite_Song_Season_2_01-12_End`, `Pellin_…_2012_TV_01-06`, `LANTERN_X_LANTERN_(2011)_-_Capitulo_61-63`.
+_REREAD_EXTRA_WORDS = frozenset({"full", "hd", "vostfr", "end", "tv", "capitulo"})
+# The release vocabulary a bracket beside a re-read part may hold (`_reread_vocabulary`), beyond `_SERIES_NOISE`: each
+# met in the tags of a right tags-only name of the measured corpus (2026-11-08): language and script tags (`[GB]`,
+# `[BIG5]`, `[AR-ENG]`, `[简繁字幕外挂]`, `[简日双语]`), container, audio and picture tags, a box's discs and volumes,
+# and `[Movie]` beside a film's title. A format word (`OVA`, `SP`, `特典映像`, `特别篇`, `总集篇`) only in a pack's
+# list of its contents (`[01-22TV全集+OVA+特别篇+总集篇]`): beside a title alone it names another entry.
+_REREAD_TOKENS = re.compile(r"[a-z0-9]+|[^\x00-\x7f]+")
+_REREAD_RANGE = re.compile(r"\d\s*[-~]\s*\d")
+_REREAD_TAG_WORD = re.compile(r"\d+(?:v\d+|tv)?|\d+x\d+|bits?|hi10p|ac3|flacx?\d*|mkv|mp4|gb|big5|eng|ar|pc|psp|hdr"
+                              r"|box\d*|disc|vol|fin|bdmv|movie")
+_REREAD_FORMAT_WORD = re.compile(r"ova|sp")
+_REREAD_CJK_TAG_CHARS = frozenset("简繁体體国日粤中三双雙语語内封字幕外挂")
+_REREAD_CJK_FORMAT_CHARS = frozenset("全集特典映像别篇总")
 _SERIES_NOISE = re.compile(
     r"\b(?:\d{3,4}p|4k|x26[45]|h\.?26[45]|hevc|avc|av1|aac\d?(?:\.\d)?|flac|opus|ddp?\d?(?:\.\d)?|eac3|"
     r"web-?dl|web-?rip|webrip|bd-?rip|bdrip|blu-?ray|bd|dvd|hdtv|remux|10-?bits?|8-?bits?|"
@@ -413,6 +438,82 @@ def _series_norm(s: str) -> str:
     return _series_words(_SEASON_DIGITS.sub(" ", _lower(s)))
 
 
+def _reread_part(title: str) -> str:
+    """`series_part` with `_` read as a space and a `【…】` group tag and tags cut as `[…]` ones are."""
+    t = _REREAD_LEAD.sub(" ", unicodedata.normalize("NFC", str(title or "")).replace("_", " "))
+    return series_part("[g] " + _REREAD_CJK_TAGS.sub(" ", t))
+
+
+def _reread_shows(title: str) -> list[tuple[str, list[tuple[str, bool]]]]:
+    """The show parts of a name's second reading, each with the words beside it: `_reread_part` when it differs from
+    `series_part` (nothing beside it: the part is the whole name), else, when it is empty, each bracket after the group
+    tag, split at `/`, `／` and `|`, with the release vocabulary cut. Beside a bracket's part are the other alternatives
+    of its bracket and every other bracket after the group tag, each `(text, another script excuses it)`: an
+    alternative anywhere and a bracket before the show's may be its name in another script (`[中文名/Title]`,
+    `[Grp][中文名][Title]`); a bracket after the show's may not (an arc's name, `[Title][<arc> 其一][01]`).
+    Never the group tag: a group named like a title's word (`[Pellin] Kite Song - 01` for an entry whose synonym is
+    `Pellin`) would pass as it."""
+    first, part = series_part(title), _reread_part(title)
+    if part:
+        return [(part, [])] if part != first else []
+    t = unicodedata.normalize("NFC", str(title or "")).replace("_", " ")
+    lead = _REREAD_LEAD.match(t)
+    brackets = [m.group(1) or m.group(2) or "" for m in _REREAD_BRACKETS.finditer(t[lead.end():] if lead else t)]
+    out: list[tuple[str, list[tuple[str, bool]]]] = []
+    for i, bracket in enumerate(brackets):
+        alts = _REREAD_ALTERNATIVES.split(bracket)
+        for j, alt in enumerate(alts):
+            alt_part = series_part(f"[g] {alt}")
+            if alt_part and alt_part not in (p for p, _ in out):
+                beside = [(a, True) for k, a in enumerate(alts) if k != j]
+                beside += [(b, k < i) for k, b in enumerate(brackets) if k != i]
+                out.append((alt_part, beside))
+    return out
+
+
+def _reread_beside(text: str, other_script: bool, matched: str | None, variants: list[str]) -> bool:
+    """Words beside a re-read bracket's part leave the name the entry's alone: release vocabulary or numbers
+    (`_reread_vocabulary`), another of the entry's names (`_reread_passes`), or, where `other_script` allows it, words
+    wholly in a script the matched title does not use (`sibling_reading`'s rule). Anything else may name another show,
+    season or episode (`[Title][<arc>]`, `[Title][Recap]`, `[Show A][Show B]`), which the spaced name's franchise and
+    sibling readings would see and the bracket's part alone hides."""
+    scripts = _scripts(text)
+    if other_script and scripts and not scripts & (_scripts(matched or "") | {"Latin"}):
+        return True
+    if _reread_vocabulary(text):
+        return True
+    part = series_part(f"[g] {text}")
+    return bool(part) and _part_similarity(part, variants)[0] >= SERIES_SIMILARITY and _reread_passes(part, variants)
+
+
+def _reread_vocabulary(text: str) -> bool:
+    """A bracket of release vocabulary: every Latin token a tag (`_SERIES_NOISE`, `_REREAD_TAG_WORD`,
+    `_REREAD_EXTRA_WORDS`) or a number, every other run of letters made of `_REREAD_CJK_TAG_CHARS`. A format word
+    (`_REREAD_FORMAT_WORD`, `_REREAD_CJK_FORMAT_CHARS`) counts only in a pack's list of contents, a bracket that states
+    a range or `全集` (`[01-12TV全集+OVA+特典映像]`); alone it names another entry (`[Title][OVA][01]`)."""
+    t = unicodedata.normalize("NFKC", text).lower()
+    contents = bool(_REREAD_RANGE.search(t)) or "全集" in t
+    tokens = _REREAD_TOKENS.findall(_SERIES_NOISE.sub(" ", t))
+    for tok in tokens:
+        if tok.isascii():
+            if not (tok in _REREAD_EXTRA_WORDS or _REREAD_TAG_WORD.fullmatch(tok)
+                    or (contents and _REREAD_FORMAT_WORD.fullmatch(tok))):
+                return False
+        elif not all(ch in _REREAD_CJK_TAG_CHARS or (contents and ch in _REREAD_CJK_FORMAT_CHARS)
+                     or not ch.isalpha() for ch in tok):
+            return False
+    return True
+
+
+def _reread_passes(part: str, variants: list[str]) -> bool:
+    """A re-read part names the entry only: every word of it is a word of one of its titles, a number, or a word of
+    `_REREAD_EXTRA_WORDS`. The first reading takes a name that holds a title among other words (`Show Rising - 01` for
+    `Show`); a second one that did would pass another show of the franchise or a name built on a short synonym
+    (`Kite_Academy_LxL` for `LxL`, `ab_-_a_tale_of_kites_End` for `End Tale`, `Show_Rising_01` for `Show`)."""
+    known = {w for v in variants or () for w in _series_norm(v).split()}
+    return all(w in known or w.isdigit() or w in _REREAD_EXTRA_WORDS for w in _series_norm(part).split())
+
+
 def series_similarity(title: str, variants: list[str]) -> tuple[float, str | None]:
     """Best match between a release title's show name and any known title of the target.
 
@@ -421,7 +522,13 @@ def series_similarity(title: str, variants: list[str]) -> tuple[float, str | Non
     being fetched. Measured: `[AnimeQX] GO FOR BEACON (Complete Series)` matches the AniList entry
     whose romaji is `Deng Ta Qianjin X`, because the English title is in its synonyms.
     """
-    cand = _series_norm(series_part(title))
+    best, who, _ = _best_show_part(title, variants)
+    return best, who
+
+
+def _part_similarity(part: str, variants: list[str]) -> tuple[float, str | None]:
+    """`series_similarity` of one show part."""
+    cand = _series_norm(part)
     if not cand:
         return 0.0, None
     ctok = set(cand.split())
@@ -440,6 +547,22 @@ def series_similarity(title: str, variants: list[str]) -> tuple[float, str | Non
         if ratio > best:
             best, who = ratio, v
     return best, who
+
+
+def _best_show_part(title: str, variants: list[str]) -> tuple[float, str | None, str | None]:
+    """`series_similarity`'s score and title, and the re-read part that scored it (None when the first reading did).
+    The second reading (`_reread_shows`) is asked only below the bar, and a part of it counts only when it names the
+    entry alone (`_reread_passes`), so no name the first reading passes or scores is read otherwise."""
+    best, who = _part_similarity(series_part(title), variants)
+    if best >= SERIES_SIMILARITY:
+        return best, who, None
+    chosen = None
+    for part, beside in _reread_shows(title):
+        sim, name = _part_similarity(part, variants)
+        if (sim >= SERIES_SIMILARITY and sim > best and _reread_passes(part, variants)
+                and all(_reread_beside(text, other, name, variants) for text, other in beside)):
+            best, who, chosen = sim, name, part
+    return best, who, chosen
 
 
 # `series_similarity` passes a name by spelling alone when its words share none with any title: the
@@ -543,7 +666,9 @@ def spelling_reading(title: str, variants: list[str], titles=()) -> SpellingRead
       clause above. And never for a word of a spaced script, Latin or other, where a name word that starts with the
       title's word is another entry built on the stem (`Kestrelwing` for `Kestrel`).
     The drop starts with `series`, the show test's own code."""
-    words = _show_words(title)
+    reread = _best_show_part(title, variants)[2]
+    # A name the second reading passed is asked with the words of the part it read.
+    words = _series_norm(reread).split() if reread else _show_words(title)
     every = [_series_norm(v).split() for v in (*(variants or ()), *(titles or ()))]
     if not words or any(set(words) & set(vw) for vw in every):
         return SpellingReading(None, "")
@@ -751,6 +876,10 @@ def sibling_reading(title: str, variants: list[str], movie: bool = False) -> tup
     """`(name, name read in every script, the scripts it was read in)` for one release title, from one
     pass. The trace logs the second and third next to the first, so a word the script rule set aside, and why,
     can be read from the log."""
+    if _best_show_part(title, variants)[2] is not None:
+        # Passed only by the second reading, whose part names the entry alone (`_reread_passes`, `_reread_beside`):
+        # what is left beside it is release vocabulary (`Full HD … VOSTFR`, `BOX Disc 1-5`, `Vol.1-8`), no show.
+        return None, None, []
     vtok: set[str] = set()
     for v in variants or []:
         vtok |= _folded_words(v)                      # the show test's word identity, folded
@@ -1178,10 +1307,45 @@ def franchise_words(title: str, episode: int, alt=()) -> tuple[frozenset, int | 
     return (frozenset(), None, False) if span is None else (frozenset(_title_tokens(span)), n, explicit)
 
 
+_TAGS_EPISODE = re.compile(r"\d{1,4}(?:v\d)?")
+
+
+@functools.lru_cache(maxsize=4096)
+def _tags_opened(title: str) -> str:
+    """A name written wholly in tags (`[Grp][Title][01][1080p]`: nothing is left outside them once the second
+    reading cuts its group tag and tags, `_reread_part`) as its spaced twin is written: its brackets after the group
+    tag opened from the first that is not release vocabulary (`_reread_vocabulary`) on, up to the first opened one
+    that is a bare episode number, written as the twin's marker, `[Grp] Title - 01 [1080p]`; the brackets after it
+    stay tags, as the twin's are (`[Grp][Title][01][x264 01]` read with its tag as words would end at the tag's `01`).
+    Read as leading tags, such a name had no words before its episode marker, so the franchise rule and every reader
+    of its text passed what the second reading passed, a later season's `[Grp][<the first season's title>][01]` among
+    them, which its twin `[Grp] <title> - 01` is refused as. Leading vocabulary stays a tag (`[Grp][BIG5][Title][01]`);
+    any other name is returned as given."""
+    t = unicodedata.normalize("NFC", str(title or "")).replace("_", " ")
+    lead = _REREAD_LEAD.match(t)
+    if lead is None or _reread_part(t):
+        return title
+    opened, marked = False, False
+
+    def bracket(m: re.Match) -> str:
+        nonlocal opened, marked
+        inner = m.group(1) or m.group(2) or ""
+        if marked:
+            return m.group(0)
+        opened = opened or not _reread_vocabulary(inner)
+        if opened and _TAGS_EPISODE.fullmatch(inner.strip()):
+            marked = True
+            return f" - {inner.strip()} "
+        return f" {inner} " if opened else m.group(0)
+
+    return t[:lead.end()] + _REREAD_BRACKETS.sub(bracket, t[lead.end():])
+
+
 def _franchise_text(title: str) -> str:
     """The text `_franchise_span` reads its marker in: the name without its leading tags and extension, a dotted scene
-    name's dots and every `_` read as spaces."""
-    t = _FRANCHISE_LEAD.sub(" ", _name_body(title))
+    name's dots and every `_` read as spaces. A name written wholly in tags is read as its spaced twin
+    (`_tags_opened`)."""
+    t = _FRANCHISE_LEAD.sub(" ", _name_body(_tags_opened(title)))
     if t.count(".") >= 3 and " " not in t.strip():
         t = t.replace(".", " ")
     return t.replace("_", " ")
@@ -1827,7 +1991,7 @@ def release_matches_target(title: str, variants: list[str], episode: int,
     """
     if check_episode and not title_matches_episode(title, episode, alt):
         return False, "episode"
-    sim, _ = series_similarity(title, variants)
+    sim, _, reread = _best_show_part(title, variants)
     if sim < SERIES_SIMILARITY:
         return False, f"series {sim:.2f}"
     spelling = spelling_only_reason(title, variants, titles)   # before the pack exemption: a pack is asked too
@@ -1843,7 +2007,9 @@ def release_matches_target(title: str, variants: list[str], episode: int,
         return True, "ok"
     if parse_title(title).get("batch"):
         return True, "pack"
-    rs = season_number(title)
+    # A name the second reading passed is read as it read it, `_` as a space: `\b` never fires inside `_Season_1_`,
+    # so the raw name stated no season and another season passed as `season not stated`.
+    rs = season_number(title.replace("_", " ") if reread else title)
     if rs is None:
         # Silence is not season 1. `[Kumo-raws] Harbor Nights Part 2 - 01` is AniList's *second*
         # entry and names no season at all, so reading an absent season as 1 rejects a release that

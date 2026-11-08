@@ -129,15 +129,32 @@ def entry(media_id, episode) -> dict | None:
     return got if isinstance(got, dict) else None
 
 
+# The fields of a found download (`FOUND`) a retake of its entry carries forward (`latch`), under `CARRIED`.
+CARRIED = "carried"
+CARRIED_KEYS = ("state", "infoHash", "torrentId", "trace", "doneAt")
+
+
+def _found_part(got: dict) -> dict | None:
+    """The entry's found download: the entry itself when its own outcome is one (`FOUND`, with a hash), else the one
+    a retake carried forward (`CARRIED`) read over it; None when neither."""
+    if got.get("state") in FOUND and got.get("infoHash"):
+        return got
+    carried = got.get(CARRIED)
+    if isinstance(carried, dict) and carried.get("state") in FOUND and carried.get("infoHash"):
+        return {**got, **carried}
+    return None
+
+
 def found(media_id, episode) -> dict | None:
-    """The download the prefetch left for this episode (added, or found already on the account), younger than
-    `KEEP_S`; else None."""
+    """The download the prefetch left for this episode (added, queued, or found already on the account), younger than
+    `KEEP_S` since it was found; else None. A retake of the entry (`latch`) carries it forward, so while the new
+    prefetch runs, and after it ends with nothing of its own found (skipped, failed), the download is still the one
+    `cli.prefetched_first` tries first: no second download starts beside it."""
     got = entry(media_id, episode)
-    if not got or got.get("state") not in FOUND or not got.get("infoHash"):
+    part = _found_part(got) if got else None
+    if part is None or _clock() - float(part.get("doneAt") or part.get("at") or 0) > KEEP_S:
         return None
-    if _clock() - float(got.get("doneAt") or got.get("at") or 0) > KEEP_S:
-        return None
-    return got
+    return part
 
 
 def _digest(value) -> str:
@@ -239,17 +256,54 @@ def sideload_reuse(got: dict, policy: str, lang: str) -> tuple[bool, str]:
                   "side-loaded")
 
 
+def _age(got: dict, now: float) -> float:
+    return now - float(got.get("doneAt") or got.get("at") or 0)
+
+
+def holds(got: dict | None, now: float | None = None) -> bool:
+    """Whether an entry still latches its episode: younger than `REUSE_S`, the window in which a play may
+    play its record without a search. An older one would only stop a new prefetch while the reuse refuses it, so a
+    viewer back the next day got neither; the tick takes it again (`latch`), and the new prefetch adds nothing when
+    TorBox already has the release (cached, or on the account). Within the window BACK and a replay start none."""
+    return isinstance(got, dict) and _age(got, _clock() if now is None else now) <= REUSE_S
+
+
+def holding(media_id, episode) -> dict | None:
+    """The episode's entry while it latches (`holds`), else None: the one read without the lock each tick makes."""
+    got = entry(media_id, episode)
+    return got if holds(got) else None
+
+
 def latch(media_id, episode, record: dict, log: Log) -> dict | None:
-    """Take the episode's latch: under the lock, no entry for it yet, then `record` written and read back. The entry
-    already there when another tick (or another Service) took it first, else None once it is ours. Old entries go."""
+    """Take the episode's latch: under the lock, no entry for it that still `holds`, then `record` written and read
+    back. The entry already there when another tick (or another Service) took it first, else None once it is ours.
+    Old entries go; an entry past `REUSE_S` is replaced (one `prefetch latch` line with its age and state), and a
+    download it found (`found`: added, queued, on the account) is carried into the new entry (`CARRIED`), so the new
+    prefetch's resolve still tries that download first and adds no second one for the episode."""
     now = _clock()
     k = key(media_id, episode)
+    carried = None
     with _locked(log):
-        entries = {name: e for name, e in load().items()
-                   if isinstance(e, dict) and now - float(e.get("doneAt") or e.get("at") or 0) <= KEEP_S}
-        if k in entries:
+        entries = {name: e for name, e in load().items() if isinstance(e, dict) and _age(e, now) <= KEEP_S}
+        if k in entries and holds(entries[k], now):
             return entries[k]
-        entries[k] = {**record, "mediaId": int(media_id), "episode": int(episode), "state": STARTED, "at": now}
+        if k in entries:
+            old = entries[k]
+            part = _found_part(old)
+            if part is not None:
+                carried = {name: part.get(name) for name in CARRIED_KEYS}
+                carried["doneAt"] = float(part.get("doneAt") or part.get("at") or 0)
+            log.info("prefetch", "latch", result="RETAKE", key=k, state=old.get("state"),
+                     age_h=round(_age(old, now) / 3600, 1), reuse_h=REUSE_S / 3600,
+                     carried=None if carried is None else {"state": carried["state"],
+                                                           "info_hash": carried["infoHash"],
+                                                           "torrent_id": carried["torrentId"]},
+                     reason="the entry is older than the reuse's window: the play would search anyway, so the "
+                            "prefetch runs again and leaves a record the play can reuse" + (
+                                "; the download it found is carried, so the new prefetch tries it first"
+                                if carried else ""))
+        entries[k] = {**record, "mediaId": int(media_id), "episode": int(episode), "state": STARTED, "at": now,
+                      **({CARRIED: carried} if carried else {})}
         _write(entries)
     back = entry(media_id, episode)
     if not back or back.get("at") != now:

@@ -328,6 +328,19 @@ function initialCellIndex(cells) {
   return 0
 }
 
+// Where the episode cursor goes when Browse opens again on a show's episodes: onto the episode that show played last,
+// when it played after Browse last closed. A press here dismisses Browse and the cursor stays on the pressed
+// cell; auto-next or the player's own episode list then plays another, and the reopened page pointed at the first.
+// `played` is the Service's `lastPlayed` ({mediaId, episode, at}), `closedAt` Browse's last close (ms). The cursor
+// stays where it is otherwise: another show, an older play (the viewer moved the cursor since), no such cell.
+function cursorAfterPlay(cells, cellIndex, mediaId, played, closedAt) {
+  if (!isList(cells) || !played || !(Number(mediaId) > 0) || Number(played.mediaId) !== Number(mediaId))
+    return cellIndex
+  if (!(Number(played.at) > Number(closedAt || 0))) return cellIndex
+  for (var i = 0; i < cells.length; i++) if (Number(cells[i].episode) === Number(played.episode)) return i
+  return cellIndex
+}
+
 function detailHeader(media) {
   var lastAired = lastAiredEpisode(media)
   var episodesText = ""
@@ -709,7 +722,18 @@ function gridColumns(width, minCard) {
 
 // Order of the rejected groups: the ones that say "wrong show" first, because under a franchise
 // refusal those are the answer; the ones that say "right show, can't stream it" after.
-var PICKER_REASONS = ["other_show", "series", "season", "seeders", "pack_range", "pack_files", "size", "batch"]
+// A `series` row with no other show named (`show` empty): its title does not name the show, and nothing says what it
+// is instead, so the picker never calls it another show: its own group, "Does not name <title>", and its own
+// ask (`pickerAsk`). Over the measured corpus 959 of 994 own-words `series` rows name no show, the entry's own
+// releases its reading misses among them (`Lantern S03E20 (Harbor Arc)` for a later season's own episode).
+var PICKER_UNNAMED = "series_unnamed"
+
+function _unnamedSeries(r) {
+  return !!r && String(r.reason || "") === "series" && !r.show
+}
+
+var PICKER_REASONS = ["other_show", "series", PICKER_UNNAMED, "season", "seeders", "pack_range", "pack_files", "size",
+                      "batch"]
 
 function sizeText(bytes) {
   var n = Number(bytes)
@@ -798,7 +822,7 @@ function pickerItems(data, pin) {
   var groups = {}
   var order = PICKER_REASONS.slice()
   for (var j = 0; j < rejected.length; j++) {
-    var reason = String(rejected[j].reason || "other")
+    var reason = _unnamedSeries(rejected[j]) ? PICKER_UNNAMED : String(rejected[j].reason || "other")
     if (!groups[reason]) groups[reason] = []
     groups[reason].push(rejected[j])
     if (order.indexOf(reason) < 0) order.push(reason)
@@ -806,7 +830,9 @@ function pickerItems(data, pin) {
   for (var k = 0; k < order.length; k++) {
     var rows = groups[order[k]]
     if (!rows || rows.length === 0) continue
-    var label = order[k] === "other_show" ? "Other shows" : _capital(rows[0].why || order[k])
+    var title = data.show_title ? String(data.show_title) : "this show"
+    var label = order[k] === "other_show" ? "Other shows"
+              : order[k] === PICKER_UNNAMED ? "Does not name " + title : _capital(rows[0].why || order[k])
     items.push({ kind: "header", text: label + " · " + rows.length })
     for (var m = 0; m < rows.length; m++) items.push(_pickerRow(rows[m], failed, pin, want))
   }
@@ -885,6 +911,7 @@ function pickerAsk(item, data, episode) {
   var why = String(item.why || "")
   var name = pickerShortTitle(item.title)
   var it = name ? "“" + name + "”" : ""
+  if (_unnamedSeries(item)) return "This release does not name " + title + ". Play it anyway?"
   if (reason === "other_show" || reason === "series" || atOnce) {
     var also = atOnce && why ? " It was also ruled out: " + why + "." : ""
     return (it ? "This is " + it + ", another show" : "This release names another show") + ", not " + title + "."
@@ -941,7 +968,8 @@ function pickerNoneOwn(data) {
   for (var i = 0; i < rejected.length; i++) {
     var r = rejected[i], reason = String(r.reason || "")
     var atOnce = PICKER_AT_ONCE.indexOf(reason) >= 0
-    if (reason === "other_show" || reason === "series" || (r.show && (others || !atOnce))) kind("other shows")
+    if (_unnamedSeries(r)) kind("releases that do not name it")
+    else if (reason === "other_show" || reason === "series" || (r.show && (others || !atOnce))) kind("other shows")
     else if (reason === "season") kind("other seasons")
     else if (reason === "episode" || reason === "pack_range" || reason === "pack_files") kind("other episodes")
     else if (atOnce) {
@@ -1419,7 +1447,7 @@ var SERVICE_FUNCTIONS = {
 // Every Service property Browse reads. An absent one reads as undefined (no throw); it is listed so the log names it.
 var SERVICE_PROPERTIES = [
   "accounts", "accountsError", "accountsLoading", "agentNotes", "bin", "busy", "configPath", "languageNames",
-  "laterAnswer", "lastError", "lastErrorPicker",
+  "laterAnswer", "lastError", "lastErrorPicker", "lastPlayed",
   "notice", "pickerData", "pickerError", "pickerLoading", "playEntry", "playEpisode", "playHeld", "playMediaId",
   "playRefusal", "settings",
   "settingsError",

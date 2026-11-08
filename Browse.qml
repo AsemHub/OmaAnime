@@ -124,6 +124,8 @@ Item {
   // Detail view. It layers over whichever list opened it; the list keeps its
   // cursor, so Escape lands exactly where the user left.
   property bool detailOpen: false
+  // When Browse last closed (ms): an episode played after it moves the episode cursor on the next open.
+  property real closedAt: 0
   property int detailMediaId: 0
   property var detailMedia: null
   property bool detailLoading: false
@@ -606,6 +608,7 @@ Item {
     if (root.service && root.service.settings)
       root.showCompleted = root.logic.asBool(root.service.settings.showCompletedInTop, false)
     root.opened = true
+    root.followLastPlayed()
     root.ensureLoaded()
     // The window opens at the top, which is where Accounts is, so `accounts` needs no scrolling — only the state:
     // the providers from a 10-minute cache, the indexer add-ons read fresh (`openSettings`).
@@ -654,10 +657,26 @@ Item {
     }
     root.opened = false
     root.playPending = false
+    root.closedAt = Date.now()
+  }
+
+  // Opened again on a show's episodes after it played another episode (auto-next, the player's own list): the cursor
+  // goes to that episode, not the one pressed before Browse closed. One line when it moves.
+  function followLastPlayed() {
+    if (!root.detailOpen || !root.service) return
+    var cells = root.detailCells
+    var to = Model.cursorAfterPlay(cells, root.cellIndex, root.detailMediaId, root.service.lastPlayed, root.closedAt)
+    if (to === root.cellIndex) return
+    root.svc.logEvent(root.svc.newTrace("browse-cursor"), "browse.cursor",
+                      { mediaId: root.detailMediaId, from: cells[root.cellIndex] ? cells[root.cellIndex].episode : null,
+                        to: cells[to].episode, why: "this episode played after Browse closed" })
+    root.cellIndex = to
+    root.positionOnCursor()
   }
 
   // Dismissing ourselves goes through the host so openPanelIds stays in sync.
   function dismiss() {
+    root.closedAt = Date.now()
     if (root.shell && typeof root.shell.hide === "function") root.shell.hide(root.pluginId)
     else root.close()
   }
